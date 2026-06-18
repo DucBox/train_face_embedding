@@ -37,6 +37,12 @@ class PartialFC_V2(torch.nn.Module):
         num_classes: int,
         sample_rate: float = 1.0,
         fp16: bool = False,
+        hard_neg_mining: bool = False,
+        hard_neg_ratio: float = 0.2,
+        hard_neg_topk: int = 50,
+        hard_neg_warmup_steps: int = 0,
+        hard_neg_refresh_interval: int = 2000,
+        hard_neg_queue_size: int = 8192,
     ):
         """
         Paramenters:
@@ -47,6 +53,21 @@ class PartialFC_V2(torch.nn.Module):
             Total number of classes, required
         sample_rate: float
             The rate of negative centers participating in the calculation, default is 1.0.
+        hard_neg_mining: bool
+            If True, bias the per-step negative-class subsample towards classes whose
+            centers are close to the positive classes in the batch, instead of pure
+            uniform random. See `configs/base.py` for the related `hard_neg_*` knobs.
+        hard_neg_ratio: float
+            Max fraction of `num_sample` reserved for hard negatives each step.
+        hard_neg_topk: int
+            Number of cached nearest-neighbor classes kept per class center.
+        hard_neg_warmup_steps: int
+            Number of steps to keep pure-random sampling before enabling mining.
+        hard_neg_refresh_interval: int
+            Steps between neighbor-cache refreshes for a given class.
+        hard_neg_queue_size: int
+            Size of the FIFO queue of classes recently found to produce high
+            "confusing" (near-margin) logits against a positive class.
         """
         super(PartialFC_V2, self).__init__()
         assert (
@@ -72,6 +93,33 @@ class PartialFC_V2(torch.nn.Module):
         self.init_weight_update: bool = True
         self.weight = torch.nn.Parameter(torch.normal(0, 0.01, (self.num_local, embedding_size)))
 
+        # Hard-negative mining state (see class docstring / configs/base.py)
+        self.hard_neg_mining = hard_neg_mining
+        self.hard_neg_ratio = hard_neg_ratio
+        self.hard_neg_topk = hard_neg_topk
+        self.hard_neg_warmup_steps = hard_neg_warmup_steps
+        self.hard_neg_refresh_interval = hard_neg_refresh_interval
+        self.hard_neg_queue_size = hard_neg_queue_size
+        self.global_step = 0
+
+        if self.hard_neg_mining:
+            self.register_buffer(
+                "neighbor_cache",
+                torch.full((self.num_local, self.hard_neg_topk), -1, dtype=torch.long),
+                persistent=False,
+            )
+            self.register_buffer(
+                "neighbor_cache_step",
+                torch.full((self.num_local,), -1, dtype=torch.long),
+                persistent=False,
+            )
+            self.register_buffer(
+                "confusion_queue",
+                torch.full((self.hard_neg_queue_size,), -1, dtype=torch.long),
+                persistent=False,
+            )
+            self.confusion_queue_ptr = 0
+
         # margin_loss
         if isinstance(margin_loss, Callable):
             self.margin_softmax = margin_loss
@@ -81,6 +129,51 @@ class PartialFC_V2(torch.nn.Module):
                 self.register_buffer('batch_std', torch.ones(1)*100)
         else:
             raisee
+
+    def set_sample_rate(self, sample_rate: float):
+        """Update the PartialFC sample rate mid-training (e.g. for a fine-tune schedule)."""
+        self.sample_rate = sample_rate
+        self.num_sample = int(self.sample_rate * self.num_local)
+
+    def _refresh_neighbor_cache(self, class_indices: torch.Tensor):
+        """Lazily (re)compute the top-k nearest other class centers for stale/missing entries."""
+        if class_indices.numel() == 0:
+            return
+        stale = (self.neighbor_cache_step[class_indices] < 0) | (
+            self.global_step - self.neighbor_cache_step[class_indices] > self.hard_neg_refresh_interval
+        )
+        to_refresh = class_indices[stale]
+        if to_refresh.numel() == 0:
+            return
+
+        centers = normalize(self.weight)
+        query = centers[to_refresh]
+        sims = query @ centers.t()
+        sims[torch.arange(to_refresh.size(0), device=sims.device), to_refresh] = -2.0  # exclude self
+        k = min(self.hard_neg_topk, self.num_local - 1)
+        topk = sims.topk(k, dim=1).indices
+        self.neighbor_cache[to_refresh, :k] = topk
+        self.neighbor_cache_step[to_refresh] = self.global_step
+
+    def _update_confusion_queue(self, logits: torch.Tensor, labels: torch.Tensor, index_positive: torch.Tensor):
+        """Push classes that produced the highest non-target logit for a positive sample
+        (i.e. the model's current 'closest confusion') into the FIFO hard-negative queue."""
+        if index_positive.numel() == 0:
+            return
+        sub_logits = logits[index_positive].clone()
+        target_cols = labels[index_positive].view(-1, 1)
+        sub_logits.scatter_(1, target_cols, float("-inf"))
+        top_val, top_col = sub_logits.max(dim=1)
+
+        k = min(top_col.numel(), max(1, self.hard_neg_queue_size // 4))
+        _, sel = top_val.topk(k)
+        hard_local_idx = self.weight_index[top_col[sel]]
+
+        n = hard_local_idx.numel()
+        ptr = self.confusion_queue_ptr
+        slots = (torch.arange(n, device=hard_local_idx.device) + ptr) % self.hard_neg_queue_size
+        self.confusion_queue[slots] = hard_local_idx
+        self.confusion_queue_ptr = (ptr + n) % self.hard_neg_queue_size
 
     def sample(self, labels, index_positive):
         """
@@ -97,10 +190,37 @@ class PartialFC_V2(torch.nn.Module):
         with torch.no_grad():
             positive = torch.unique(labels[index_positive], sorted=True).cuda()
             if self.num_sample - positive.size(0) >= 0:
-                perm = torch.rand(size=[self.num_local]).cuda()
-                perm[positive] = 2.0
-                index = torch.topk(perm, k=self.num_sample)[1].cuda()
-                index = index.sort()[0].cuda()
+                device = self.weight.device
+                chosen = positive
+                mining_active = self.hard_neg_mining and self.global_step >= self.hard_neg_warmup_steps
+
+                if mining_active:
+                    self._refresh_neighbor_cache(positive)
+                    hard_pool = self.neighbor_cache[positive]
+                    hard_pool = hard_pool[hard_pool >= 0]
+                    queued = self.confusion_queue[self.confusion_queue >= 0]
+                    if queued.numel() > 0:
+                        hard_pool = torch.cat([hard_pool, queued])
+                    if hard_pool.numel() > 0:
+                        hard_pool = torch.unique(hard_pool)
+                        hard_pool = hard_pool[~torch.isin(hard_pool, positive)]
+
+                    remaining_room = self.num_sample - positive.size(0)
+                    hard_budget = min(
+                        hard_pool.numel(),
+                        remaining_room,
+                        int(self.hard_neg_ratio * self.num_sample),
+                    )
+                    if hard_budget > 0:
+                        if hard_pool.numel() > hard_budget:
+                            sel = torch.randperm(hard_pool.numel(), device=device)[:hard_budget]
+                            hard_pool = hard_pool[sel]
+                        chosen = torch.cat([chosen, hard_pool])
+
+                perm = torch.rand(size=[self.num_local], device=device)
+                perm[chosen] = 2.0
+                index = torch.topk(perm, k=self.num_sample)[1].to(device)
+                index = index.sort()[0]
             else:
                 index = positive
             self.weight_index = index
@@ -182,6 +302,13 @@ class PartialFC_V2(torch.nn.Module):
             self.batch_std.data = batch_std.data
         else:
             raise ValueError('parital FC margin_softmax not supported type')
+
+        if self.sample_rate < 1 and self.hard_neg_mining:
+            with torch.no_grad():
+                row_index_positive = torch.where(index_positive.view(-1))[0]
+                self._update_confusion_queue(logits, labels, row_index_positive)
+            self.global_step += 1
+
         loss = self.dist_cross_entropy(logits, labels)
         return loss
 

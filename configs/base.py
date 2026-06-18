@@ -19,6 +19,24 @@ config.embedding_size = 512
 config.sample_rate = 1
 config.interclass_filtering_threshold = 0
 
+# PartialFC sample_rate schedule (opt-in). List of [start_epoch, sample_rate] pairs,
+# e.g. [[0, 0.3], [60, 1.0]] keeps the base sample_rate until epoch 60, then switches
+# to full sampling (no PFC subsampling) for a fine-tune tail to expose every negative
+# class each step. Leave as None to keep config.sample_rate fixed for the whole run.
+config.sample_rate_schedule = None
+
+# Hard-negative-aware PartialFC sampling (opt-in, default off = original random sampling).
+# When enabled, a fraction of each step's negative-class budget is filled with classes
+# whose centers are closest to the positive classes in the batch (cached kNN over class
+# centers) plus classes recently found to produce high "confusing" logits, instead of
+# pure uniform random. The rest of the budget stays random to preserve global coverage.
+config.hard_neg_mining = False
+config.hard_neg_ratio = 0.2            # max fraction of the PFC sample budget reserved for hard negatives
+config.hard_neg_topk = 50              # cached nearest-neighbor classes per class center
+config.hard_neg_warmup_epoch = 10      # epochs of pure-random sampling before enabling mining
+config.hard_neg_refresh_interval = 2000  # steps between neighbor-cache refresh for a given class
+config.hard_neg_queue_size = 8192      # size of the dynamic "recently confused" class queue
+
 config.fp16 = False
 config.batch_size = 128
 

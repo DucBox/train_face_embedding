@@ -209,10 +209,22 @@ def main(args):
             interclass_filtering_threshold=cfg.interclass_filtering_threshold
         )       
 
+    cfg.total_batch_size = cfg.batch_size * world_size
+    steps_per_epoch = cfg.num_image // cfg.total_batch_size // cfg.gradient_acc
+    cfg.warmup_step = steps_per_epoch * cfg.warmup_epoch
+    cfg.total_step = steps_per_epoch * cfg.num_epoch
+    hard_neg_warmup_steps = steps_per_epoch * cfg.hard_neg_warmup_epoch
+
     if cfg.optimizer == "sgd":
         module_partial_fc = PartialFC_V2(
             margin_loss, cfg.embedding_size, cfg.num_classes,
-            cfg.sample_rate, False)
+            cfg.sample_rate, False,
+            hard_neg_mining=cfg.hard_neg_mining,
+            hard_neg_ratio=cfg.hard_neg_ratio,
+            hard_neg_topk=cfg.hard_neg_topk,
+            hard_neg_warmup_steps=hard_neg_warmup_steps,
+            hard_neg_refresh_interval=cfg.hard_neg_refresh_interval,
+            hard_neg_queue_size=cfg.hard_neg_queue_size)
         module_partial_fc.train().cuda()
         # TODO the params of partial fc must be last in the params list
         opt = torch.optim.SGD(
@@ -222,17 +234,19 @@ def main(args):
     elif cfg.optimizer == "adamw":
         module_partial_fc = PartialFC_V2(
             margin_loss, cfg.embedding_size, cfg.num_classes,
-            cfg.sample_rate, False)
+            cfg.sample_rate, False,
+            hard_neg_mining=cfg.hard_neg_mining,
+            hard_neg_ratio=cfg.hard_neg_ratio,
+            hard_neg_topk=cfg.hard_neg_topk,
+            hard_neg_warmup_steps=hard_neg_warmup_steps,
+            hard_neg_refresh_interval=cfg.hard_neg_refresh_interval,
+            hard_neg_queue_size=cfg.hard_neg_queue_size)
         module_partial_fc.train().cuda()
         opt = torch.optim.AdamW(
             params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}],
             lr=cfg.lr, weight_decay=cfg.weight_decay)
     else:
         raise
-
-    cfg.total_batch_size = cfg.batch_size * world_size
-    cfg.warmup_step = (cfg.num_image // cfg.total_batch_size // cfg.gradient_acc) * cfg.warmup_epoch
-    cfg.total_step = (cfg.num_image // cfg.total_batch_size // cfg.gradient_acc) * cfg.num_epoch
 
     lr_scheduler = PolynomialLRWarmup(
         optimizer=opt,
@@ -298,6 +312,18 @@ def main(args):
         for epoch in range(start_epoch, cfg.num_epoch):
             if isinstance(train_loader, DataLoader):
                 train_loader.sampler.set_epoch(epoch)
+
+            if cfg.sample_rate_schedule:
+                scheduled_rate = None
+                for sched_epoch, sched_rate in cfg.sample_rate_schedule:
+                    if epoch >= sched_epoch:
+                        scheduled_rate = sched_rate
+                if scheduled_rate is not None and scheduled_rate != module_partial_fc.sample_rate:
+                    if local_rank == 0:
+                        print(f"[sample_rate_schedule] epoch {epoch}: PartialFC sample_rate "
+                              f"{module_partial_fc.sample_rate} -> {scheduled_rate}")
+                    module_partial_fc.set_sample_rate(scheduled_rate)
+
             for _, (img, local_labels) in enumerate(train_loader):
                 global_step += 1
                 local_embeddings = backbone(img)

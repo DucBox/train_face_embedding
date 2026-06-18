@@ -16,6 +16,16 @@ config.resume = False
 config.output = "/workspace/data/workspace/face_embedding/outputs/vit36_webface_synthetic_public_only_new_id_71m_3m6"
 config.embedding_size = 512
 config.sample_rate = 0.3
+# Switch PartialFC to full sampling for the last few epochs (fine-tune tail) to expose
+# every negative class each step. e.g. [[0, 0.3], [65, 1.0]]. None = keep sample_rate fixed.
+config.sample_rate_schedule = None
+# Hard-negative-aware sampling (opt-in). See configs/base.py for the hard_neg_* knobs.
+config.hard_neg_mining = False
+config.hard_neg_ratio = 0.2
+config.hard_neg_topk = 50
+config.hard_neg_warmup_epoch = 10
+config.hard_neg_refresh_interval = 2000
+config.hard_neg_queue_size = 8192
 config.fp16 = True
 config.weight_decay = 0.1
 config.batch_size = 384
