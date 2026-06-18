@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pt
+*.onnx
+*.safetensors
+*.rec
+*.idx
+work_dirs/
+outputs/
+.DS_Store
+.claude/
