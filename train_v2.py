@@ -213,7 +213,11 @@ def main(args):
     steps_per_epoch = cfg.num_image // cfg.total_batch_size // cfg.gradient_acc
     cfg.warmup_step = steps_per_epoch * cfg.warmup_epoch
     cfg.total_step = steps_per_epoch * cfg.num_epoch
-    hard_neg_warmup_steps = steps_per_epoch * cfg.hard_neg_warmup_epoch
+    # module_partial_fc.global_step counts every forward() call (micro-step), not every
+    # optimizer step, so its warmup must be expressed in micro-steps/epoch (no gradient_acc
+    # division) - otherwise warmup ends gradient_acc times earlier than hard_neg_warmup_epoch.
+    micro_steps_per_epoch = cfg.num_image // cfg.total_batch_size
+    hard_neg_warmup_steps = micro_steps_per_epoch * cfg.hard_neg_warmup_epoch
 
     if cfg.optimizer == "sgd":
         module_partial_fc = PartialFC_V2(
@@ -261,6 +265,7 @@ def main(args):
         global_step = dict_checkpoint["global_step"]
         backbone.module.load_state_dict(dict_checkpoint["state_dict_backbone"])
         module_partial_fc.load_state_dict(dict_checkpoint["state_dict_softmax_fc"])
+        module_partial_fc.global_step = dict_checkpoint.get("hard_neg_step", 0)
         opt.load_state_dict(dict_checkpoint["state_optimizer"])
         lr_scheduler.load_state_dict(dict_checkpoint["state_lr_scheduler"])
 
@@ -372,6 +377,7 @@ def main(args):
                 checkpoint = {
                     "epoch": epoch + 1,
                     "global_step": global_step,
+                    "hard_neg_step": module_partial_fc.global_step,
                     "state_dict_backbone": backbone.module.state_dict(),
                     "state_dict_softmax_fc": module_partial_fc.state_dict(),
                     "state_optimizer": opt.state_dict(),
