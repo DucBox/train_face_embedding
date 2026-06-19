@@ -4,3 +4,4 @@ mxnet
 onnx
 sklearn
 opencv-python
+pyarrow
