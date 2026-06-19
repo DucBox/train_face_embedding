@@ -5,3 +5,4 @@ onnx
 sklearn
 opencv-python
 pyarrow
+tqdm

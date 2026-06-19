@@ -28,6 +28,7 @@ import numpy as np
 import pyarrow.dataset as pads
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from utils.utils_config import get_config
 
@@ -68,11 +69,14 @@ def main():
     dataset = _open_embedding_dataset(args.embeddings_dir)
     device = torch.device(args.device)
     embed_dim, num_classes = cfg.embedding_size, cfg.num_classes
+    n_rows = dataset.count_rows()
+    n_read_batches = -(-n_rows // args.read_batch_size)  # ceil div
 
     print("Pass 1/3: accumulating per-class centroids ...")
     centroid_sum = torch.zeros((num_classes, embed_dim), dtype=torch.float64)
     centroid_count = torch.zeros((num_classes,), dtype=torch.int64)
-    for embeddings, identity, _, _ in _iter_batches(dataset, embed_dim, args.read_batch_size):
+    for embeddings, identity, _, _ in tqdm(_iter_batches(dataset, embed_dim, args.read_batch_size),
+                                            total=n_read_batches, desc="pass1 centroids", unit="batch"):
         emb = torch.from_numpy(embeddings).double()
         lbl = torch.from_numpy(identity)
         centroid_sum.index_add_(0, lbl, emb)
@@ -93,7 +97,8 @@ def main():
     chunk, topk = args.centroid_chunk, min(args.topk, n_with_images - 1)
 
     cand_a, cand_b, cand_score = [], [], []
-    for start in range(0, valid_idx.numel(), chunk):
+    chunk_starts = list(range(0, valid_idx.numel(), chunk))
+    for start in tqdm(chunk_starts, desc="pass2 impostor search", unit="chunk"):
         rows = valid_idx[start:start + chunk].to(device)
         sims = centroids_dev[rows] @ centroids_dev.t()
         sims[torch.arange(rows.numel(), device=device), rows] = -2.0
@@ -102,8 +107,6 @@ def main():
         cand_a.append(rows.repeat_interleave(vals.size(1)).cpu())
         cand_b.append(cols.flatten().cpu())
         cand_score.append(vals.flatten().cpu())
-        if start % (chunk * 20) == 0:
-            print(f"  {start:,}/{valid_idx.numel():,} classes searched")
     cand_a, cand_b, cand_score = torch.cat(cand_a), torch.cat(cand_b), torch.cat(cand_score)
 
     # dedup symmetric (a,b)/(b,a) duplicates
@@ -130,7 +133,9 @@ def main():
 
     print("Pass 3/3: scoring genuine (same-identity, leave-one-out) images against threshold ...")
     false_reject_rows = []
-    for embeddings, identity, rec_idx, file_prefix in _iter_batches(dataset, embed_dim, args.read_batch_size):
+    for embeddings, identity, rec_idx, file_prefix in tqdm(_iter_batches(dataset, embed_dim, args.read_batch_size),
+                                                             total=n_read_batches, desc="pass3 genuine scoring",
+                                                             unit="batch"):
         emb = torch.from_numpy(embeddings)
         lbl = torch.from_numpy(identity)
 

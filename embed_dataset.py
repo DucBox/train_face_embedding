@@ -33,6 +33,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
 from torchvision import transforms
+from tqdm import tqdm
 
 from backbones import get_model
 from utils.utils_config import get_config
@@ -198,8 +199,9 @@ def main():
     total_written = 0
     cursor = 0
 
+    progress = tqdm(loader, total=len(loader), desc=f"rank{rank} embed", position=rank, unit="batch")
     with torch.no_grad():
-        for imgs, lbls, idxs in loader:
+        for imgs, lbls, idxs in progress:
             imgs = imgs.to(device, non_blocking=True)
             feat = F.normalize(net(imgs), dim=1)
             n = feat.size(0)
@@ -210,8 +212,6 @@ def main():
             buf_file_prefix.append(file_prefix_shard[cursor:cursor + n])
             buf_rows += n
             cursor += n
-            if rank == 0 and (cursor // args.batch_size) % 50 == 0:
-                print(f"[rank 0] {cursor:,}/{n_shard:,}")
 
             if buf_rows >= args.flush_rows:
                 total_written += write_chunk(buf_embeddings, buf_identity, buf_rec_idx, buf_file_prefix,
@@ -219,6 +219,7 @@ def main():
                 chunk_idx += 1
                 buf_embeddings, buf_identity, buf_rec_idx, buf_file_prefix = [], [], [], []
                 buf_rows = 0
+                progress.set_postfix(chunks=chunk_idx)
 
     if buf_rows > 0:
         total_written += write_chunk(buf_embeddings, buf_identity, buf_rec_idx, buf_file_prefix,
