@@ -118,6 +118,34 @@ def build_backbone(cfg):
     return get_model(cfg.network, dropout=0.0, fp16=False, num_features=cfg.embedding_size)
 
 
+def write_chunk(buf_embeddings, buf_identity, buf_rec_idx, buf_file_prefix,
+                 embedding_size, output_dir, rank, chunk_idx):
+    """Write one accumulated chunk as its own Parquet part, then the caller can
+    drop the buffer - this caps peak RAM to ~flush_rows worth of data instead of
+    the whole per-rank shard (which can be tens of GB at full dataset scale)."""
+    embeddings = np.concatenate(buf_embeddings, axis=0)
+    identity = np.concatenate(buf_identity, axis=0)
+    rec_idx = np.concatenate(buf_rec_idx, axis=0)
+    file_prefix = np.concatenate(buf_file_prefix, axis=0)
+
+    table = pa.table({
+        "identity": pa.array(identity, type=pa.int32()),
+        "file_prefix": pa.array(file_prefix, type=pa.string()),
+        "rec_idx": pa.array(rec_idx, type=pa.int64()),
+        "embedding": pa.FixedSizeListArray.from_arrays(
+            pa.array(embeddings.reshape(-1), type=pa.float32()), embedding_size),
+    })
+    pads.write_dataset(
+        table,
+        base_dir=output_dir,
+        format="parquet",
+        partitioning=pads.partitioning(pa.schema([("file_prefix", pa.string())]), flavor="hive"),
+        basename_template=f"part-rank{rank}-chunk{chunk_idx}-{{i}}.parquet",
+        existing_data_behavior="overwrite_or_ignore",
+    )
+    return len(identity)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Embed the training set to a Parquet dataset")
     parser.add_argument("config", type=str, help="e.g. configs/wf42m_pfc03_40epoch_64gpu_vit_l")
@@ -125,6 +153,9 @@ def main():
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--flush-rows", type=int, default=500_000,
+                         help="write a Parquet chunk every this many embedded images, "
+                              "instead of holding the whole per-rank shard in RAM at once")
     args = parser.parse_args()
 
     cfg = get_config(args.config)
@@ -158,42 +189,44 @@ def main():
     net.eval().to(device)
 
     n_shard = end - start
-    embeddings = np.zeros((n_shard, cfg.embedding_size), dtype=np.float32)
-    identity = np.zeros((n_shard,), dtype=np.int32)
-    rec_idx = np.zeros((n_shard,), dtype=np.int64)
     file_prefix_shard = file_prefix_per_image[start:end]
+    os.makedirs(args.output_dir, exist_ok=True)
 
+    buf_embeddings, buf_identity, buf_rec_idx, buf_file_prefix = [], [], [], []
+    buf_rows = 0
+    chunk_idx = 0
+    total_written = 0
     cursor = 0
+
     with torch.no_grad():
         for imgs, lbls, idxs in loader:
             imgs = imgs.to(device, non_blocking=True)
             feat = F.normalize(net(imgs), dim=1)
             n = feat.size(0)
-            embeddings[cursor:cursor + n] = feat.cpu().numpy().astype(np.float32)
-            identity[cursor:cursor + n] = lbls.numpy()
-            rec_idx[cursor:cursor + n] = idxs.numpy()
+
+            buf_embeddings.append(feat.cpu().numpy().astype(np.float32))
+            buf_identity.append(lbls.numpy().astype(np.int32))
+            buf_rec_idx.append(idxs.numpy().astype(np.int64))
+            buf_file_prefix.append(file_prefix_shard[cursor:cursor + n])
+            buf_rows += n
             cursor += n
             if rank == 0 and (cursor // args.batch_size) % 50 == 0:
                 print(f"[rank 0] {cursor:,}/{n_shard:,}")
 
-    table = pa.table({
-        "identity": pa.array(identity, type=pa.int32()),
-        "file_prefix": pa.array(file_prefix_shard, type=pa.string()),
-        "rec_idx": pa.array(rec_idx, type=pa.int64()),
-        "embedding": pa.FixedSizeListArray.from_arrays(
-            pa.array(embeddings.reshape(-1), type=pa.float32()), cfg.embedding_size),
-    })
+            if buf_rows >= args.flush_rows:
+                total_written += write_chunk(buf_embeddings, buf_identity, buf_rec_idx, buf_file_prefix,
+                                              cfg.embedding_size, args.output_dir, rank, chunk_idx)
+                chunk_idx += 1
+                buf_embeddings, buf_identity, buf_rec_idx, buf_file_prefix = [], [], [], []
+                buf_rows = 0
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    pads.write_dataset(
-        table,
-        base_dir=args.output_dir,
-        format="parquet",
-        partitioning=pads.partitioning(pa.schema([("file_prefix", pa.string())]), flavor="hive"),
-        basename_template=f"part-rank{rank}-{{i}}.parquet",
-        existing_data_behavior="overwrite_or_ignore",
-    )
-    print(f"[rank {rank}] wrote {n_shard:,} rows to {args.output_dir} (partitioned by file_prefix)")
+    if buf_rows > 0:
+        total_written += write_chunk(buf_embeddings, buf_identity, buf_rec_idx, buf_file_prefix,
+                                      cfg.embedding_size, args.output_dir, rank, chunk_idx)
+        chunk_idx += 1
+
+    print(f"[rank {rank}] wrote {total_written:,} rows to {args.output_dir} "
+          f"(partitioned by file_prefix, {chunk_idx} chunk(s) of <= {args.flush_rows:,} rows each)")
 
 
 if __name__ == "__main__":
