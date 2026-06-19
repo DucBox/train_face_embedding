@@ -147,10 +147,16 @@ def write_chunk(buf_embeddings, buf_identity, buf_rec_idx, buf_file_prefix,
     return len(identity)
 
 
+# Default checkpoint used when --weight isn't passed - edit to match where your
+# run actually saved model.pt / model_epoch_N.pt (see config.output in train_v2.py).
+DEFAULT_WEIGHT = "/path/to/model.pt"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Embed the training set to a Parquet dataset")
     parser.add_argument("config", type=str, help="e.g. configs/wf42m_pfc03_40epoch_64gpu_vit_l")
-    parser.add_argument("--weight", type=str, required=True, help="backbone state_dict .pt (e.g. model.pt)")
+    parser.add_argument("--weight", type=str, default=DEFAULT_WEIGHT,
+                         help=f"backbone state_dict .pt (e.g. model.pt), default: {DEFAULT_WEIGHT}")
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=4)
