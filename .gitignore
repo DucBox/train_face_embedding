@@ -9,3 +9,5 @@ work_dirs/
 outputs/
 .DS_Store
 .claude/
+*.zip
+cfp-dataset/

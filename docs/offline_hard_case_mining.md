@@ -31,16 +31,39 @@ Tune if needed:
 
 ## 2) Find the FMR threshold + hard cases
 
+`config` and `--embeddings-dir` default to `DEFAULT_CONFIG` / `DEFAULT_EMBEDDINGS_DIR`
+at the top of `find_hard_thresholds.py` - edit those constants, or override per-run.
+`--output-dir` defaults to `--embeddings-dir` if not given.
+
 ```bash
-python3 find_hard_thresholds.py configs/wf42m_pfc03_40epoch_64gpu_vit_l \
-    --embeddings-dir "$OUT" --output-dir "$OUT" --fmr 1e-6
+python3 find_hard_thresholds.py --embeddings-dir "$OUT" --fmr 1e-6
 ```
 
 Tune if needed:
-- `--topk` (default 50): nearest-centroid candidates kept per identity for the
-  impostor search - raise it if the script warns the threshold is only a lower
-  bound (not enough candidates collected to reach the target FMR).
+- `--topk` (default 50) / `--centroid-chunk` (default 1024): see "What do topk
+  and centroid-chunk do?" below.
 - `--device`: defaults to `cuda` if available.
+
+### What do `--topk` and `--centroid-chunk` do?
+
+Both only affect Pass 2 (finding impostor identity pairs) - neither changes how
+the deployed model is used (1:1 verification is unaffected; these only exist
+because *calibrating* the FMR=1e-6 threshold requires looking across the whole
+identity population, not just one pair).
+
+- **`--centroid-chunk`**: pure performance/memory knob, no effect on the result.
+  Comparing every identity's centroid against every other identity's centroid
+  at once would need a `num_classes x num_classes` similarity matrix (infeasible
+  at millions of identities). The script instead processes `--centroid-chunk`
+  identities at a time against all centroids. Raise it if you have GPU memory
+  to spare (fewer, bigger matmuls = faster); lower it if you hit OOM.
+
+- **`--topk`**: affects correctness of the threshold estimate. For each identity,
+  only the `--topk` nearest other identities are kept as impostor candidates
+  (keeping all of them is what's infeasible in the first place). If the true
+  pool of pairs needed to reach FMR=1e-6 is larger than what `--topk` collected,
+  the script prints a warning and the threshold is only a *lower bound*. Raise
+  `--topk` if you see that warning.
 
 ## 3) Generate the hard-case artifacts
 
