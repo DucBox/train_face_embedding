@@ -62,17 +62,25 @@ class FaceDetector:
 
     def detect(self, img):
         """Returns (landmarks[5,2] in original image coords, confidence) or
-        (None, confidence) if the best detection is below MIN_CONFIDENCE."""
+        (None, confidence) if nothing clears MIN_CONFIDENCE. Among anchors that
+        do, picks the LARGEST bbox (by area), not the highest-confidence one -
+        many anchors fire on the same real face with similar confidence, plus
+        the occasional smaller spurious detection (background clutter, an ear,
+        etc); the biggest box is the more reliable proxy for "the actual
+        subject" in a single-person headshot like CFP's."""
         H0, W0 = img.shape[:2]
         resized = cv2.resize(img, (DETECTOR_INPUT_SIZE, DETECTOR_INPUT_SIZE))
         blob = resized[:, :, ::-1].astype(np.float32) / 255.0  # BGR -> RGB, [0,1]
         blob = blob.transpose(2, 0, 1)[None]
 
         out = self.session.run([self.output_name], {self.input_name: blob})[0][0]  # (8400, 16)
-        best = out[np.argmax(out[:, 15])]
+        candidates = out[out[:, 15] >= MIN_CONFIDENCE]
+        if candidates.shape[0] == 0:
+            return None, float(out[:, 15].max())
+
+        areas = candidates[:, 2] * candidates[:, 3]  # w * h
+        best = candidates[np.argmax(areas)]
         conf = float(best[15])
-        if conf < MIN_CONFIDENCE:
-            return None, conf
 
         landmarks = best[4:14].reshape(5, 2)
         scale = np.array([W0 / DETECTOR_INPUT_SIZE, H0 / DETECTOR_INPUT_SIZE], dtype=np.float32)

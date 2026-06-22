@@ -79,6 +79,28 @@ def summarize_splits(df):
     return sorted(splits, key=lambda r: r[0])
 
 
+def summarize_retention(df):
+    """Per id_number x image_type: how many images were kept in the best cluster
+    vs the identity's total for that pose, e.g. id 007 has 7 frontal + 3 profile,
+    best cluster keeps 6 frontal + 2 profile -> keep_ratio 0.857 frontal, 0.667 profile."""
+    return (
+        df.group_by(["id_number", "image_type"])
+        .agg(pl.len().alias("total"), pl.col("in_best_cluster").sum().alias("kept"))
+        .with_columns((pl.col("kept") / pl.col("total")).alias("keep_ratio"))
+        .sort(["id_number", "image_type"])
+    )
+
+
+def print_retention_stats(retention):
+    print("\nPer-identity retention rate (images kept in best cluster / total for that pose):")
+    for image_type in ["frontal", "profile"]:
+        vals = retention.filter(pl.col("image_type") == image_type)["keep_ratio"]
+        if vals.len() == 0:
+            continue
+        print(f"  {image_type:8s}: min={vals.min():6.1%}  max={vals.max():6.1%}  "
+              f"mean={vals.mean():6.1%}  median={vals.median():6.1%}  (n={vals.len()} identities)")
+
+
 def _load_thumb(cfp_dir, id_number, image_type, seq_no):
     path = os.path.join(cfp_dir, f"{id_number:03d}", image_type, f"{seq_no:02d}.jpg")
     img = Image.open(path).convert("RGB").resize(THUMB_SIZE)
@@ -152,6 +174,9 @@ def main():
         print("\nSplit identities (id_number, n_clusters, is_pose_split):")
         for id_number, n_clusters_used, is_pose_split in splits:
             print(f"  {id_number:>4} | {n_clusters_used} clusters | pose_split={is_pose_split}")
+
+    retention = summarize_retention(df)
+    print_retention_stats(retention)
 
     df.sort(["id_number", "image_type", "seq_no"]).write_parquet(args.output)
     print(f"\nPer-image cluster assignment written to {args.output}")
