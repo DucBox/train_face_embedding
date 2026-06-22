@@ -7,3 +7,4 @@ opencv-python
 pyarrow
 tqdm
 polars
+scikit-image

@@ -2,16 +2,20 @@
 Embed the CFP (Celebrities in Frontal-Profile) dataset for the DBSCAN
 clustering test in run_dbscan_cfp.py.
 
-Walks cfp-dataset/Data/Images/{id:03d}/{frontal|profile}/{seq:02d}.jpg directly
-off disk (plain JPGs, not MXNet RecordIO) and writes a single Parquet file with
-one row per image:
+Run align_cfp.py first - this script only reads the already-112x112,
+landmark-aligned crops from cfp-dataset/processed_data/ (NOT the raw images
+under cfp-dataset/Data/Images/). No cropping/resizing/alignment happens here,
+only what's needed to match the training-time input exactly: RGB, 112x112,
+CHW, (pixel/255 - 0.5) / 0.5 - no augmentation.
+
+Writes a single Parquet file with one row per image:
     id_number   int32   - the identity folder (1-500)
     image_type  string  - "frontal" or "profile"
     seq_no      int32   - the image number within that identity+pose (the "01" in 01.jpg)
     embedding   fixed_size_list<float32>[embedding_size] - L2-normalized embedding
 
     python3 embed_cfpw.py configs/wf42m_pfc03_40epoch_64gpu_vit_l \
-        --weight /path/to/model.pt --cfp-dir cfp-dataset/Data/Images --output cfp_embeddings.parquet
+        --weight /path/to/model.pt --processed-dir cfp-dataset/processed_data --output cfp_embeddings.parquet
 """
 import argparse
 import glob
@@ -24,25 +28,19 @@ import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
 from tqdm import tqdm
 
 from embed_dataset import DEFAULT_WEIGHT, build_backbone
 from utils.utils_config import get_config
 
 
-class CFPImageDataset(Dataset):
-    """Reads cfp-dataset/Data/Images/{id}/{frontal|profile}/{seq}.jpg directly off disk."""
+class CFPAlignedDataset(Dataset):
+    """Reads the already-112x112 aligned crops written by align_cfp.py."""
 
-    def __init__(self, root_dir):
-        self.paths = sorted(glob.glob(os.path.join(root_dir, "*", "*", "*.jpg")))
-        assert self.paths, f"No .jpg files found under {root_dir}"
-        self.transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize((112, 112)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
+    def __init__(self, processed_dir):
+        self.paths = sorted(glob.glob(os.path.join(processed_dir, "*", "*", "*.jpg")))
+        assert self.paths, (f"No .jpg files found under {processed_dir} - run align_cfp.py first "
+                             f"to produce the aligned crops this script expects")
 
     def __len__(self):
         return len(self.paths)
@@ -53,14 +51,15 @@ class CFPImageDataset(Dataset):
         id_number = int(os.path.basename(os.path.dirname(os.path.dirname(path))))      # "001" -> 1
         seq_no = int(os.path.splitext(os.path.basename(path))[0])                      # "01.jpg" -> 1
 
-        img = cv2.imread(path)
+        img = cv2.imread(path)                                  # BGR, HWC, uint8, already 112x112
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = self.transform(img)
+        img = torch.from_numpy(img).permute(2, 0, 1).float()    # CHW
+        img = img.div_(255).sub_(0.5).div_(0.5)                 # match training normalization exactly
         return img, id_number, image_type, seq_no
 
 
 DEFAULT_CONFIG = "configs/wf42m_pfc03_40epoch_64gpu_vit_l"
-DEFAULT_CFP_DIR = "cfp-dataset/Data/Images"
+DEFAULT_PROCESSED_DIR = "cfp-dataset/processed_data"
 DEFAULT_OUTPUT = "cfp_embeddings.parquet"
 
 
@@ -68,7 +67,8 @@ def main():
     parser = argparse.ArgumentParser(description="Embed the CFP dataset for DBSCAN clustering tests")
     parser.add_argument("config", type=str, nargs="?", default=DEFAULT_CONFIG, help=f"default: {DEFAULT_CONFIG}")
     parser.add_argument("--weight", type=str, default=DEFAULT_WEIGHT, help=f"default: {DEFAULT_WEIGHT}")
-    parser.add_argument("--cfp-dir", type=str, default=DEFAULT_CFP_DIR, help=f"default: {DEFAULT_CFP_DIR}")
+    parser.add_argument("--processed-dir", type=str, default=DEFAULT_PROCESSED_DIR,
+                         help=f"output of align_cfp.py, default: {DEFAULT_PROCESSED_DIR}")
     parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT, help=f"default: {DEFAULT_OUTPUT}")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -78,7 +78,7 @@ def main():
     cfg = get_config(args.config)
     device = torch.device(args.device)
 
-    dataset = CFPImageDataset(args.cfp_dir)
+    dataset = CFPAlignedDataset(args.processed_dir)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                          num_workers=args.num_workers, pin_memory=True)
 
