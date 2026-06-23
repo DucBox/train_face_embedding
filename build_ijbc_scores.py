@@ -39,6 +39,12 @@ from skimage import transform as trans
 
 from backbones import get_model
 
+try:
+    from tqdm import tqdm
+except ImportError:  # fallback nếu chưa cài tqdm
+    def tqdm(it, **kw):
+        return it
+
 
 # Đích align chuẩn ArcFace (giống eval_ijbc.py)
 _SRC = np.array([
@@ -113,7 +119,7 @@ def embed_all(net, image_dir, names, lmk_info, no_align, batch_size, flip, use_d
             name2feat[nm] = fe * sc                                # det-score (=1 nếu tắt)
         buf_blob.clear(); buf_name.clear(); buf_score.clear()
 
-    for i, nm in enumerate(names):
+    for nm in tqdm(names, desc="embed", unit="img"):
         path = os.path.join(image_dir, nm)
         img = cv2.imread(path)
         if img is None:
@@ -131,8 +137,6 @@ def embed_all(net, image_dir, names, lmk_info, no_align, batch_size, flip, use_d
         buf_score.append(score if use_det_score else 1.0)
         if len(buf_name) >= batch_size:
             flush()
-        if (i + 1) % 5000 == 0:
-            print(f"[embed] {i+1}/{len(names)}")
     flush()
     print(f"[embed] xong {len(name2feat)} ảnh")
     return name2feat
@@ -142,7 +146,7 @@ def image2template_feature(feats, templates, medias):
     """Pool: trung bình theo media -> cộng các media -> chuẩn hoá L2 (giống eval_ijbc)."""
     uniq_t = np.unique(templates)
     out = np.zeros((len(uniq_t), feats.shape[1]), dtype=np.float32)
-    for ci, t in enumerate(uniq_t):
+    for ci, t in enumerate(tqdm(uniq_t, desc="pool", unit="tmpl")):
         (idx,) = np.where(templates == t)
         fts = feats[idx]
         med = medias[idx]
@@ -162,11 +166,9 @@ def score_pairs(tfeat, uniq_t, p1, p2, batch=200000):
     id1 = np.array([t2id[int(x)] for x in p1])
     id2 = np.array([t2id[int(x)] for x in p2])
     score = np.empty(len(p1), dtype=np.float32)
-    for s in range(0, len(p1), batch):
+    for s in tqdm(range(0, len(p1), batch), desc="score", unit="batch"):
         e = min(s + batch, len(p1))
         score[s:e] = np.sum(tfeat[id1[s:e]] * tfeat[id2[s:e]], axis=1)
-        if s % (batch * 10) == 0:
-            print(f"[score] {e}/{len(p1)}")
     return score
 
 
