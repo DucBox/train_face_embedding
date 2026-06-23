@@ -213,22 +213,22 @@ def main(args):
     steps_per_epoch = cfg.num_image // cfg.total_batch_size // cfg.gradient_acc
     cfg.warmup_step = steps_per_epoch * cfg.warmup_epoch
     cfg.total_step = steps_per_epoch * cfg.num_epoch
-    # module_partial_fc.global_step counts every forward() call (micro-step), not every
-    # optimizer step, so its warmup must be expressed in micro-steps/epoch (no gradient_acc
-    # division) - otherwise warmup ends gradient_acc times earlier than hard_neg_warmup_epoch.
-    micro_steps_per_epoch = cfg.num_image // cfg.total_batch_size
-    hard_neg_warmup_steps = micro_steps_per_epoch * cfg.hard_neg_warmup_epoch
+
+    pco_kwargs = dict(
+        pco_stage=cfg.pco_stage,
+        pco_m1=cfg.pco_proto_m1,
+        pco_m2=cfg.pco_proto_m2,
+        pco_scale=cfg.pco_scale,
+        pco_update_center_stage3=cfg.pco_update_center_stage3,
+    )
+    if local_rank == 0:
+        print(f"[PCO] stage={cfg.pco_stage} m1={cfg.pco_proto_m1} m2={cfg.pco_proto_m2} "
+              f"scale={cfg.pco_scale} sample_rate={cfg.sample_rate}")
 
     if cfg.optimizer == "sgd":
         module_partial_fc = PartialFC_V2(
             margin_loss, cfg.embedding_size, cfg.num_classes,
-            cfg.sample_rate, False,
-            hard_neg_mining=cfg.hard_neg_mining,
-            hard_neg_ratio=cfg.hard_neg_ratio,
-            hard_neg_topk=cfg.hard_neg_topk,
-            hard_neg_warmup_steps=hard_neg_warmup_steps,
-            hard_neg_refresh_interval=cfg.hard_neg_refresh_interval,
-            hard_neg_queue_size=cfg.hard_neg_queue_size)
+            cfg.sample_rate, False, **pco_kwargs)
         module_partial_fc.train().cuda()
         # TODO the params of partial fc must be last in the params list
         opt = torch.optim.SGD(
@@ -238,13 +238,7 @@ def main(args):
     elif cfg.optimizer == "adamw":
         module_partial_fc = PartialFC_V2(
             margin_loss, cfg.embedding_size, cfg.num_classes,
-            cfg.sample_rate, False,
-            hard_neg_mining=cfg.hard_neg_mining,
-            hard_neg_ratio=cfg.hard_neg_ratio,
-            hard_neg_topk=cfg.hard_neg_topk,
-            hard_neg_warmup_steps=hard_neg_warmup_steps,
-            hard_neg_refresh_interval=cfg.hard_neg_refresh_interval,
-            hard_neg_queue_size=cfg.hard_neg_queue_size)
+            cfg.sample_rate, False, **pco_kwargs)
         module_partial_fc.train().cuda()
         opt = torch.optim.AdamW(
             params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}],
@@ -264,8 +258,9 @@ def main(args):
         start_epoch = dict_checkpoint["epoch"]
         global_step = dict_checkpoint["global_step"]
         backbone.module.load_state_dict(dict_checkpoint["state_dict_backbone"])
-        module_partial_fc.load_state_dict(dict_checkpoint["state_dict_softmax_fc"])
-        module_partial_fc.global_step = dict_checkpoint.get("hard_neg_step", 0)
+        # strict=False: the PCO feature-expectation bank may be absent (e.g. resuming a stage-1
+        # run) or extra; missing buffers keep their fresh init and get filled on first batch.
+        module_partial_fc.load_state_dict(dict_checkpoint["state_dict_softmax_fc"], strict=False)
         opt.load_state_dict(dict_checkpoint["state_optimizer"])
         lr_scheduler.load_state_dict(dict_checkpoint["state_lr_scheduler"])
 
@@ -278,6 +273,33 @@ def main(args):
                 logging.warning("EMA is enabaled but no EMA State found in ckpt")
 
         del dict_checkpoint
+
+    # Warm-start from a previous run's weights but keep a FRESH epoch/optimizer/lr-scheduler,
+    # so this run trains its own schedule from step 0 (e.g. PCO cross-stage warm-start via
+    # `cfg.pco_init_checkpoint`, or plain continued training via `cfg.init_checkpoint` - both
+    # go through the same loader). Skipped when `cfg.resume` (an interrupted run of THIS
+    # output dir is being continued instead, with its own optimizer/lr/epoch state).
+    warm_start_checkpoint = cfg.init_checkpoint or cfg.pco_init_checkpoint
+    if not cfg.resume and warm_start_checkpoint:
+        if warm_start_checkpoint.endswith(".pt"):
+            # single model.pt: backbone-only warm start, FC classifier stays freshly initialized
+            state_dict_backbone = torch.load(warm_start_checkpoint, map_location="cpu")
+            backbone.module.load_state_dict(state_dict_backbone)
+            if rank == 0:
+                logging.info(f"[init_checkpoint] warm-started backbone only from {warm_start_checkpoint}")
+        else:
+            init_path = os.path.join(warm_start_checkpoint, f"checkpoint_gpu_{rank}.pt")
+            if not os.path.exists(init_path):
+                raise FileNotFoundError(f"init checkpoint not found: {init_path}")
+            dict_init = torch.load(init_path, map_location="cpu")
+            backbone.module.load_state_dict(dict_init["state_dict_backbone"])
+            incompat = module_partial_fc.load_state_dict(
+                dict_init["state_dict_softmax_fc"], strict=False)
+            if rank == 0:
+                logging.info(f"[init_checkpoint] warm-started backbone+FC from {init_path}")
+                logging.info(f"[init_checkpoint] missing keys: {list(incompat.missing_keys)}")
+                logging.info(f"[init_checkpoint] unexpected keys: {list(incompat.unexpected_keys)}")
+            del dict_init
 
     for key, value in cfg.items():
         num_space = 25 - len(key)
@@ -377,7 +399,6 @@ def main(args):
                 checkpoint = {
                     "epoch": epoch + 1,
                     "global_step": global_step,
-                    "hard_neg_step": module_partial_fc.global_step,
                     "state_dict_backbone": backbone.module.state_dict(),
                     "state_dict_softmax_fc": module_partial_fc.state_dict(),
                     "state_optimizer": opt.state_dict(),

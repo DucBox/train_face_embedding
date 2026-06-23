@@ -15,7 +15,7 @@ NUM_SAMPLES = 1000
 # --- S3 CONFIG ---
 S3_ENDPOINT = "http://s3-data.cyberspace.vn"
 S3_ACCESS_KEY = "ttnt"
-S3_SECRET_KEY = "H?3o0nn4Irej"
+S3_SECRET_KEY = "<S3_SECRET_KEY>"
 BUCKET_NAME = "ttnt"
 
 def parse_s3_info(full_path: str):
@@ -144,7 +144,7 @@ if __name__ == "__main__":
 
 # S3_ENDPOINT = "http://s3-data.cyberspace.vn"
 # S3_ACCESS_KEY = "ttnt"
-# S3_SECRET_KEY = "H?3o0nn4Irej"
+# S3_SECRET_KEY = "<S3_SECRET_KEY>"
 # BUCKET_NAME = "ttnt"
 
 # # Bin config: [low, high, label, idx]

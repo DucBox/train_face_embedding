@@ -14,9 +14,8 @@ Writes:
         b is confusable with a), so it is expanded into both directed rows,
         sorted by class_id then score descending. This is the "ground-truth"
         global hard-negative list discussed in docs/hard_negative_sampling.md -
-        meant to seed PartialFC_V2's neighbor_cache/confusion_queue for the next
-        training run (each rank would filter this down to its own class shard),
-        instead of relying only on the FC-weight-based proxy computed online.
+        meant to drive an offline hard-negative sampling scheme for the next
+        training run (each rank would filter this down to its own class shard).
 
     hard_images_review.csv : file_prefix,rec_idx,label,genuine_score
         Same rows as false_reject.csv, sorted worst-score-first - a prioritized

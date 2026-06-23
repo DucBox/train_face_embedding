@@ -31,7 +31,7 @@ SHARD_SIZE = 1000
 
 S3_ENDPOINT = "http://s3-data.cyberspace.vn"
 S3_ACCESS_KEY = "ttnt"
-S3_SECRET_KEY = "H?3o0nn4Irej"
+S3_SECRET_KEY = "<S3_SECRET_KEY>"
 
 arcface_src = np.array(
     [[30.29459953, 51.69630051], [65.53179932, 51.50139999], [48.02519989, 71.73660278],

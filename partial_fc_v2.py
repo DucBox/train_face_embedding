@@ -37,12 +37,11 @@ class PartialFC_V2(torch.nn.Module):
         num_classes: int,
         sample_rate: float = 1.0,
         fp16: bool = False,
-        hard_neg_mining: bool = False,
-        hard_neg_ratio: float = 0.2,
-        hard_neg_topk: int = 50,
-        hard_neg_warmup_steps: int = 0,
-        hard_neg_refresh_interval: int = 2000,
-        hard_neg_queue_size: int = 8192,
+        pco_stage: int = 1,
+        pco_m1: float = 0.4,
+        pco_m2: float = 0.4,
+        pco_scale: float = 64.0,
+        pco_update_center_stage3: bool = False,
     ):
         """
         Paramenters:
@@ -53,21 +52,25 @@ class PartialFC_V2(torch.nn.Module):
             Total number of classes, required
         sample_rate: float
             The rate of negative centers participating in the calculation, default is 1.0.
-        hard_neg_mining: bool
-            If True, bias the per-step negative-class subsample towards classes whose
-            centers are close to the positive classes in the batch, instead of pure
-            uniform random. See `configs/base.py` for the related `hard_neg_*` knobs.
-        hard_neg_ratio: float
-            Max fraction of `num_sample` reserved for hard negatives each step.
-        hard_neg_topk: int
-            Number of cached nearest-neighbor classes kept per class center.
-        hard_neg_warmup_steps: int
-            Number of steps to keep pure-random sampling before enabling mining.
-        hard_neg_refresh_interval: int
-            Steps between neighbor-cache refreshes for a given class.
-        hard_neg_queue_size: int
-            Size of the FIFO queue of classes recently found to produce high
-            "confusing" (near-margin) logits against a positive class.
+        pco_stage: int
+            Progressive Cluster Optimization stage (LVFace, arXiv:2501.13420):
+              1 = Feature Alignment  -> plain CosFace + NCS (default, original behaviour).
+              2 = Centroid Stabilization -> maintain a per-class feature-expectation bank
+                  `e_i` (Eq.9-10) and use the two-anchor loss L_s (Eq.11), still with NCS.
+              3 = Boundary Refinement -> same two-anchor loss L_r (Eq.12) but the caller sets
+                  sample_rate=1.0 so the negative sum runs over ALL classes (NCS disabled).
+            Stages 2/3 require `margin_loss` to be CosFace-style; the margins below are used
+            instead of the passed-in margin_loss.
+        pco_m1: float
+            Cosine margin on the classifier-weight anchor (cosθ_i - m1), Eq.11/12.
+        pco_m2: float
+            Cosine margin on the feature-expectation anchor (cosθ_i^e - m2), Eq.11/12.
+        pco_scale: float
+            Feature scale s (paper uses 64).
+        pco_update_center_stage3: bool
+            Algorithm 1 only updates `e` inside Centroid Stabilization (stage 2). Set True to
+            keep refreshing the bank during Boundary Refinement (stage 3) as well; default
+            False matches the pseudo-code (bank frozen at the value reached at end of stage 2).
         """
         super(PartialFC_V2, self).__init__()
         assert (
@@ -93,32 +96,23 @@ class PartialFC_V2(torch.nn.Module):
         self.init_weight_update: bool = True
         self.weight = torch.nn.Parameter(torch.normal(0, 0.01, (self.num_local, embedding_size)))
 
-        # Hard-negative mining state (see class docstring / configs/base.py)
-        self.hard_neg_mining = hard_neg_mining
-        self.hard_neg_ratio = hard_neg_ratio
-        self.hard_neg_topk = hard_neg_topk
-        self.hard_neg_warmup_steps = hard_neg_warmup_steps
-        self.hard_neg_refresh_interval = hard_neg_refresh_interval
-        self.hard_neg_queue_size = hard_neg_queue_size
-        self.global_step = 0
-
-        if self.hard_neg_mining:
+        # Progressive Cluster Optimization (PCO) state. The feature-expectation bank `e_i`
+        # is sharded exactly like `weight` (one row per *local* class) and kept in fp32.
+        self.pco_stage = int(pco_stage)
+        self.pco_m1 = float(pco_m1)
+        self.pco_m2 = float(pco_m2)
+        self.pco_scale = float(pco_scale)
+        self.pco_update_center = (self.pco_stage == 2) or (
+            self.pco_stage == 3 and pco_update_center_stage3
+        )
+        if self.pco_stage >= 2:
+            # persistent=True so the bank is carried in the checkpoint from stage 2 -> stage 3.
             self.register_buffer(
-                "neighbor_cache",
-                torch.full((self.num_local, self.hard_neg_topk), -1, dtype=torch.long),
-                persistent=False,
+                "feature_center", torch.zeros(self.num_local, embedding_size, dtype=torch.float32)
             )
             self.register_buffer(
-                "neighbor_cache_step",
-                torch.full((self.num_local,), -1, dtype=torch.long),
-                persistent=False,
+                "center_inited", torch.zeros(self.num_local, dtype=torch.bool)
             )
-            self.register_buffer(
-                "confusion_queue",
-                torch.full((self.hard_neg_queue_size,), -1, dtype=torch.long),
-                persistent=False,
-            )
-            self.confusion_queue_ptr = 0
 
         # margin_loss
         if isinstance(margin_loss, Callable):
@@ -135,46 +129,6 @@ class PartialFC_V2(torch.nn.Module):
         self.sample_rate = sample_rate
         self.num_sample = int(self.sample_rate * self.num_local)
 
-    def _refresh_neighbor_cache(self, class_indices: torch.Tensor):
-        """Lazily (re)compute the top-k nearest other class centers for stale/missing entries."""
-        if class_indices.numel() == 0:
-            return
-        stale = (self.neighbor_cache_step[class_indices] < 0) | (
-            self.global_step - self.neighbor_cache_step[class_indices] > self.hard_neg_refresh_interval
-        )
-        to_refresh = class_indices[stale]
-        if to_refresh.numel() == 0:
-            return
-
-        centers = normalize(self.weight)
-        query = centers[to_refresh]
-        sims = query @ centers.t()
-        sims[torch.arange(to_refresh.size(0), device=sims.device), to_refresh] = -2.0  # exclude self
-        k = min(self.hard_neg_topk, self.num_local - 1)
-        topk = sims.topk(k, dim=1).indices
-        self.neighbor_cache[to_refresh, :k] = topk
-        self.neighbor_cache_step[to_refresh] = self.global_step
-
-    def _update_confusion_queue(self, logits: torch.Tensor, labels: torch.Tensor, index_positive: torch.Tensor):
-        """Push classes that produced the highest non-target logit for a positive sample
-        (i.e. the model's current 'closest confusion') into the FIFO hard-negative queue."""
-        if index_positive.numel() == 0:
-            return
-        sub_logits = logits[index_positive].clone()
-        target_cols = labels[index_positive].view(-1, 1)
-        sub_logits.scatter_(1, target_cols, float("-inf"))
-        top_val, top_col = sub_logits.max(dim=1)
-
-        k = min(top_col.numel(), max(1, self.hard_neg_queue_size // 4))
-        _, sel = top_val.topk(k)
-        hard_local_idx = self.weight_index[top_col[sel]]
-
-        n = hard_local_idx.numel()
-        ptr = self.confusion_queue_ptr
-        slots = (torch.arange(n, device=hard_local_idx.device) + ptr) % self.hard_neg_queue_size
-        self.confusion_queue[slots] = hard_local_idx
-        self.confusion_queue_ptr = (ptr + n) % self.hard_neg_queue_size
-
     def sample(self, labels, index_positive):
         """
             This functions will change the value of labels
@@ -190,36 +144,9 @@ class PartialFC_V2(torch.nn.Module):
         with torch.no_grad():
             positive = torch.unique(labels[index_positive], sorted=True).cuda()
             if self.num_sample - positive.size(0) >= 0:
-                device = self.weight.device
-                chosen = positive
-                mining_active = self.hard_neg_mining and self.global_step >= self.hard_neg_warmup_steps
-
-                if mining_active:
-                    self._refresh_neighbor_cache(positive)
-                    hard_pool = self.neighbor_cache[positive]
-                    hard_pool = hard_pool[hard_pool >= 0]
-                    queued = self.confusion_queue[self.confusion_queue >= 0]
-                    if queued.numel() > 0:
-                        hard_pool = torch.cat([hard_pool, queued])
-                    if hard_pool.numel() > 0:
-                        hard_pool = torch.unique(hard_pool)
-                        hard_pool = hard_pool[~torch.isin(hard_pool, positive)]
-
-                    remaining_room = self.num_sample - positive.size(0)
-                    hard_budget = min(
-                        hard_pool.numel(),
-                        remaining_room,
-                        int(self.hard_neg_ratio * self.num_sample),
-                    )
-                    if hard_budget > 0:
-                        if hard_pool.numel() > hard_budget:
-                            sel = torch.randperm(hard_pool.numel(), device=device)[:hard_budget]
-                            hard_pool = hard_pool[sel]
-                        chosen = torch.cat([chosen, hard_pool])
-
-                perm = torch.rand(size=[self.num_local], device=device)
-                perm[chosen] = 2.0
-                index = torch.topk(perm, k=self.num_sample)[1].to(device)
+                perm = torch.rand(size=[self.num_local], device=self.weight.device)
+                perm[positive] = 2.0
+                index = torch.topk(perm, k=self.num_sample)[1]
                 index = index.sort()[0]
             else:
                 index = positive
@@ -276,6 +203,10 @@ class PartialFC_V2(torch.nn.Module):
         labels[~index_positive] = -1
         labels[index_positive] -= self.class_start
 
+        # PCO stage>=2 needs the per-class *local* ids before NCS (`sample`) overwrites
+        # `labels` with sampled-column indices, to index/update the feature-expectation bank.
+        center_labels = labels.clone() if self.pco_stage >= 2 else None
+
         if self.sample_rate < 1:
             weight = self.sample(labels, index_positive)
         else:
@@ -292,6 +223,9 @@ class PartialFC_V2(torch.nn.Module):
             logits = logits.float()
         logits = logits.clamp(-1, 1)
 
+        if self.pco_stage >= 2:
+            return self._pco_loss(norm_embeddings, logits, labels, index_positive, center_labels)
+
         if isinstance(self.margin_softmax, CombinedMarginLoss):
             logits = self.margin_softmax(logits=logits, labels=labels)
         elif isinstance(self.margin_softmax, AdaFaceLoss):
@@ -303,14 +237,163 @@ class PartialFC_V2(torch.nn.Module):
         else:
             raise ValueError('parital FC margin_softmax not supported type')
 
-        if self.sample_rate < 1 and self.hard_neg_mining:
-            with torch.no_grad():
-                row_index_positive = torch.where(index_positive.view(-1))[0]
-                self._update_confusion_queue(logits, labels, row_index_positive)
-            self.global_step += 1
-
         loss = self.dist_cross_entropy(logits, labels)
         return loss
+
+    def _pco_loss(self, norm_embeddings, logits, labels, index_positive, center_labels):
+        """Progressive Cluster Optimization loss for stages 2 (Eq.11) and 3 (Eq.12).
+
+        Both stages share the *same* two-anchor objective
+            L = log(1 + Sneg * e^{-s(cosθ_i - m1)} + Sneg * e^{-s(cosθ_i^e - m2)})
+        where Sneg = Σ_{j≠y_i} e^{s cosθ_j} is the negative sum over the columns that are
+        actually present (the NCS subset for stage 2, all classes for stage 3 when the caller
+        sets sample_rate=1.0). The only stage-2-vs-3 difference handled here is whether the
+        feature-expectation bank keeps being updated (`self.pco_update_center`).
+
+        Args
+        ----
+        norm_embeddings : [B, d] unit-norm features of the *gathered* global batch.
+        logits          : [B, L] cosθ to the local (sampled) class columns, fp32, clamped.
+        labels          : [B, 1] target column index into `logits` for rows owned by this
+                          rank, -1 elsewhere.
+        index_positive  : [B, 1] bool, rows whose true class lives on this rank's shard.
+        center_labels   : [B, 1] *local* class id (pre-NCS-remap) for owned rows, -1 else.
+        """
+        B = logits.size(0)
+        device = logits.device
+        owner_mask = index_positive.view(-1)                # [B] bool
+        target_col = labels.view(-1)                        # [B] long (valid where owner)
+        cls_all = center_labels.view(-1)                    # [B] local class id (valid where owner)
+        nf = norm_embeddings.float()                        # [B, d] fp32, unit norm
+        rows = torch.where(owner_mask)[0]
+
+        # ---- (1) maintain the feature-expectation bank e_i  (Eq.9-10) ------------------
+        # Each rank owns a disjoint class shard, so a class is touched on exactly one rank.
+        # Lazy init (e_i <- x_i for a never-seen class) ALWAYS runs so the prototype anchor is
+        # well-defined even with a frozen bank (stage 3); the EMA *update* of already-seen
+        # classes is gated by `self.pco_update_center` (Algorithm 1: only stage 2 by default).
+        if rows.numel() > 0:
+            with torch.no_grad():
+                cls = cls_all[rows]                         # [P] local class ids of owned rows
+                feats = nf[rows]                            # [P, d]
+                uniq, inv = torch.unique(cls, return_inverse=True)
+                d = feats.size(1)
+                sum_feat = torch.zeros(uniq.size(0), d, device=device, dtype=torch.float32)
+                sum_feat.index_add_(0, inv, feats)
+                cnt = torch.zeros(uniq.size(0), device=device, dtype=torch.float32)
+                cnt.index_add_(0, inv, torch.ones(inv.size(0), device=device, dtype=torch.float32))
+                mean_feat = normalize(sum_feat / cnt.unsqueeze(1))   # [U, d] mean direction per class
+                e_old = self.feature_center[uniq]                    # [U, d]
+                inited = self.center_inited[uniq].unsqueeze(1)       # [U, 1]
+                if self.pco_update_center:
+                    # α_i = σ(cos(e_i, x_i)) (Eq.10); e_i^new = α e_i^old + (1-α) x̄_i (Eq.9).
+                    cos_e = (normalize(e_old) * mean_feat).sum(1).clamp(-1, 1)
+                    alpha = torch.sigmoid(cos_e).unsqueeze(1)
+                    e_ema = alpha * e_old + (1.0 - alpha) * mean_feat
+                    # un-seen classes start from x_i; seen classes follow the EMA.
+                    self.feature_center[uniq] = torch.where(inited, e_ema, mean_feat)
+                    self.center_inited[uniq] = True
+                elif (~inited).any():
+                    # frozen bank: only lazily initialise classes never seen in stage 2.
+                    new = (~inited).squeeze(1)
+                    self.feature_center[uniq[new]] = mean_feat[new]
+                    self.center_inited[uniq[new]] = True
+
+        # ---- (2) prototype cosine cosθ_i^e = cos(x_i, e_{y_i})  (2nd anchor) ------------
+        # e is a frozen buffer here -> detach; gradient flows only into the feature x_i,
+        # pulling it towards its (fixed) class prototype.
+        proto_cos = torch.zeros(B, device=device, dtype=torch.float32)
+        if rows.numel() > 0:
+            e = normalize(self.feature_center[cls_all[rows]].detach())   # [P, d]
+            proto_cos = proto_cos.index_put((rows,), (nf[rows] * e).sum(1))
+
+        # ---- (3) two-anchor distributed loss (Eq.11 / Eq.12) ---------------------------
+        return PCODistLossFunc.apply(
+            logits.float(), proto_cos, target_col, owner_mask,
+            self.pco_scale, self.pco_m1, self.pco_m2,
+        )
+
+
+class PCODistLossFunc(torch.autograd.Function):
+    """Distributed two-anchor PCO loss (LVFace Eq.11/12), sharded over class columns.
+
+    Per (gathered) sample i, with z_i = cosθ_i (classifier-weight anchor), p_i = cosθ_i^e
+    (feature-expectation anchor) and Sneg_i = Σ_{j≠y_i} e^{s cosθ_j}:
+
+        L_i = log(1 + Sneg_i e^{-s(z_i - m1)} + Sneg_i e^{-s(p_i - m2)}),   loss = mean_i L_i
+
+    The class columns are split across ranks; the true class y_i (hence z_i and p_i) lives on
+    exactly one rank. Forward replicates the per-row scalars via all_reduce; backward returns
+    the *local* gradient w.r.t. this rank's columns, so it composes with the existing AllGather
+    (which sums embedding grads across ranks) exactly like DistCrossEntropyFunc does.
+
+    Sanity check: with only the first anchor (p term absent) this reduces *exactly* to
+    DistCrossEntropy(+CosFace) — grad_neg = (s/B)·softmax_neg, grad_target = -(s/B)·(A/D).
+    """
+
+    @staticmethod
+    def forward(ctx, cos_logits, proto_cos, target_col, owner_mask, s, m1, m2):
+        device = cos_logits.device
+        B = cos_logits.size(0)
+        rows = torch.where(owner_mask)[0]
+
+        scaled = s * cos_logits                                      # [B, L]
+        # global max over all class columns (across ranks) for numerical stability.
+        gmax = scaled.max(dim=1).values                             # [B]
+        distributed.all_reduce(gmax, distributed.ReduceOp.MAX)
+        el = torch.exp(scaled - gmax.unsqueeze(1))                  # [B, L] in (0, 1]
+
+        full_sum = el.sum(dim=1)                                    # [B] local partial (shifted)
+        distributed.all_reduce(full_sum, distributed.ReduceOp.SUM)  # Σ_all e^{s cosθ} · e^{-gmax}
+
+        # target cosine z_i and prototype cosine p_i: each owned by one rank -> SUM to replicate.
+        z = torch.zeros(B, device=device, dtype=cos_logits.dtype)
+        if rows.numel() > 0:
+            z[rows] = cos_logits[rows, target_col[rows]]
+        distributed.all_reduce(z, distributed.ReduceOp.SUM)
+        p = proto_cos.clone()
+        distributed.all_reduce(p, distributed.ReduceOp.SUM)
+
+        el_target = torch.exp(s * z - gmax)                        # [B] shifted target exp
+        # Sneg excludes the true class -> subtract its (raw-cosine) contribution.
+        snegsh = (full_sum - el_target).clamp_min(1e-30)           # [B] = e^{-gmax}·Sneg
+        log_snegsh = torch.log(snegsh)
+
+        # log A_i and log B_i with the same gmax shift (A = Sneg e^{-s(z-m1)}, B = Sneg e^{-s(p-m2)}).
+        logA = log_snegsh + gmax - s * (z - m1)
+        logB = log_snegsh + gmax - s * (p - m2)
+        zeros = torch.zeros_like(logA)
+        logD = torch.logsumexp(torch.stack([zeros, logA, logB], dim=0), dim=0)  # log(1 + A + B)
+        loss = logD.mean()
+
+        ratioA = torch.exp(logA - logD)                            # A/D ∈ [0,1]
+        ratioB = torch.exp(logB - logD)                            # B/D ∈ [0,1]
+        # negative-column gradient coefficient: (1/B)·s·el·R, with R = (A/D + B/D)/Sneg_shifted.
+        R = (ratioA + ratioB) / snegsh
+
+        ctx.save_for_backward(el, R, ratioA, ratioB, target_col, owner_mask)
+        ctx.s = float(s)
+        ctx.B = B
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        el, R, ratioA, ratioB, target_col, owner_mask = ctx.saved_tensors
+        s, B = ctx.s, ctx.B
+        # all local columns treated as negatives first ...
+        grad_cos = (s / B) * el * R.unsqueeze(1)                   # [B, L]
+        rows = torch.where(owner_mask)[0]
+        if rows.numel() > 0:
+            # ... then overwrite the true-class column on its owner rank (excluded from Sneg).
+            grad_cos[rows, target_col[rows]] = (-s / B) * ratioA[rows]
+        grad_cos = grad_cos * grad_out
+
+        grad_proto = torch.zeros(B, device=el.device, dtype=el.dtype)
+        if rows.numel() > 0:
+            grad_proto[rows] = (-s / B) * ratioB[rows]
+        grad_proto = grad_proto * grad_out
+
+        return grad_cos, grad_proto, None, None, None, None, None
 
 
 class DistCrossEntropyFunc(torch.autograd.Function):

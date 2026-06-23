@@ -25,17 +25,31 @@ config.interclass_filtering_threshold = 0
 # class each step. Leave as None to keep config.sample_rate fixed for the whole run.
 config.sample_rate_schedule = None
 
-# Hard-negative-aware PartialFC sampling (opt-in, default off = original random sampling).
-# When enabled, a fraction of each step's negative-class budget is filled with classes
-# whose centers are closest to the positive classes in the batch (cached kNN over class
-# centers) plus classes recently found to produce high "confusing" logits, instead of
-# pure uniform random. The rest of the budget stays random to preserve global coverage.
-config.hard_neg_mining = False
-config.hard_neg_ratio = 0.2            # max fraction of the PFC sample budget reserved for hard negatives
-config.hard_neg_topk = 50              # cached nearest-neighbor classes per class center
-config.hard_neg_warmup_epoch = 10      # epochs of pure-random sampling before enabling mining
-config.hard_neg_refresh_interval = 2000  # steps between neighbor-cache refresh for a given class
-config.hard_neg_queue_size = 8192      # size of the dynamic "recently confused" class queue
+# ===== Progressive Cluster Optimization (PCO) — LVFace, arXiv:2501.13420 =====
+# Stage of the 3-stage progressive schedule. Run as separate jobs, warm-starting each stage
+# from the previous stage's checkpoint via `config.pco_init_checkpoint`.
+#   1 = Feature Alignment      : plain CosFace + NCS  (default == original behaviour)
+#   2 = Centroid Stabilization : maintain feature-expectation bank e_i + two-anchor loss (Eq.11)
+#   3 = Boundary Refinement    : same two-anchor loss (Eq.12), set sample_rate=1.0 (NCS off)
+config.pco_stage = 1
+config.pco_proto_m1 = 0.4   # margin on classifier-weight anchor (cosθ_i - m1)
+config.pco_proto_m2 = 0.4   # margin on feature-expectation anchor (cosθ_i^e - m2)
+config.pco_scale = 64.0     # feature scale s (paper: 64)
+# Algorithm 1 freezes e during stage 3; set True to keep updating the bank in stage 3 too.
+config.pco_update_center_stage3 = False
+# Directory of the previous stage's output (containing checkpoint_gpu_{rank}.pt) to warm-start
+# from. Loads backbone + classifier (+ bank if present) but resets epoch/optimizer/lr. None = off.
+config.pco_init_checkpoint = None
+
+# General-purpose version of the above, for plain continued training outside the PCO staging
+# scheme - e.g. "ran 60 epochs, now continue 30 more with a new lr/warmup/num_epoch schedule"
+# rather than resuming the exact same run state. Loads weights only (fresh epoch/optimizer/lr).
+# Set to either:
+#   - a directory containing checkpoint_gpu_{rank}.pt (preferred: also warm-starts the FC
+#     classifier weights, not just the backbone - matters when num_classes is unchanged)
+#   - a single model.pt file (backbone only; FC classifier initializes fresh)
+# Ignored when config.resume is True (an interrupted run of THIS output dir takes priority).
+config.init_checkpoint = None
 
 config.fp16 = False
 config.batch_size = 128

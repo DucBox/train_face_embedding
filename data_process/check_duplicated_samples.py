@@ -67,7 +67,7 @@ def get_s3_client():
         "s3",
         endpoint_url="http://s3-data.cyberspace.vn",
         aws_access_key_id="ttnt",
-        aws_secret_access_key="H?3o0nn4Irej",
+        aws_secret_access_key="<S3_SECRET_KEY>",
     )
 
 def parse_s3_path(full_path):

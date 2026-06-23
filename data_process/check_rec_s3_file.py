@@ -16,7 +16,7 @@ OUTPUT_S3_DIR = "/workspace/FaceNist/raw_data_processing/output_parquet/data_pro
 S3_CFG = {
     "endpoint": "http://s3-data.cyberspace.vn",
     "ak": "ttnt",
-    "sk": "H?3o0nn4Irej",
+    "sk": "<S3_SECRET_KEY>",
     "bucket": "ttnt"
 }
 
