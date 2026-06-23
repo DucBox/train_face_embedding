@@ -100,45 +100,72 @@ def read_landmarks(path):
     return info
 
 
-@torch.no_grad()
-def embed_all(net, image_dir, names, lmk_info, no_align, batch_size, flip, use_det_score):
-    """Embed list ảnh -> dict name -> feat512 (sum orig+flip nếu bật, nhân det-score nếu bật)."""
-    name2feat = {}
-    n_view = 2 if flip else 1
-    buf_blob, buf_name, buf_score = [], [], []
+class _ImgDataset(torch.utils.data.Dataset):
+    """Đọc + align ảnh trong worker (song song nhiều core)."""
 
-    def flush():
-        if not buf_blob:
-            return
-        blob = np.stack(buf_blob).astype(np.float32)              # (n_view*B,3,112,112)
-        t = torch.from_numpy(blob).cuda()
-        t.div_(255).sub_(0.5).div_(0.5)
-        feat = net(t).cpu().numpy()                               # (n_view*B,512)
-        feat = feat.reshape(len(buf_name), n_view, -1).sum(axis=1)  # gộp các view -> (B,512)
-        for nm, sc, fe in zip(buf_name, buf_score, feat):
-            name2feat[nm] = fe * sc                                # det-score (=1 nếu tắt)
-        buf_blob.clear(); buf_name.clear(); buf_score.clear()
+    def __init__(self, image_dir, names, lmk_info, no_align, flip, use_det_score):
+        self.image_dir = image_dir
+        self.names = names
+        self.lmk_info = lmk_info
+        self.no_align = no_align
+        self.flip = flip
+        self.use_det_score = use_det_score
 
-    for nm in tqdm(names, desc="embed", unit="img"):
-        path = os.path.join(image_dir, nm)
-        img = cv2.imread(path)
+    def __len__(self):
+        return len(self.names)
+
+    def __getitem__(self, i):
+        nm = self.names[i]
+        img = cv2.imread(os.path.join(self.image_dir, nm))
         if img is None:
-            print(f"[warn] không đọc được ảnh: {path}")
-            continue
-        if no_align:
+            return nm, None, 1.0
+        if self.no_align:
             lmk, score = None, 1.0
         else:
-            if nm not in lmk_info:
-                print(f"[warn] thiếu landmark cho {nm}, bỏ qua")
-                continue
-            lmk, score = lmk_info[nm]
-        buf_blob.extend(preprocess(img, lmk, no_align, flip))
-        buf_name.append(nm)
-        buf_score.append(score if use_det_score else 1.0)
-        if len(buf_name) >= batch_size:
-            flush()
-    flush()
-    print(f"[embed] xong {len(name2feat)} ảnh")
+            if nm not in self.lmk_info:
+                return nm, None, 1.0
+            lmk, score = self.lmk_info[nm]
+        views = preprocess(img, lmk, self.no_align, self.flip)      # list (3,112,112) uint8
+        blob = np.stack(views).astype(np.float32)                  # (n_view,3,112,112)
+        return nm, blob, (score if self.use_det_score else 1.0)
+
+
+def _collate(batch):
+    batch = [b for b in batch if b[1] is not None]                 # bỏ ảnh hỏng/thiếu landmark
+    if not batch:
+        return [], None, []
+    names = [b[0] for b in batch]
+    scores = [b[2] for b in batch]
+    blob = np.concatenate([b[1] for b in batch], 0)                # (n_view*B,3,112,112)
+    return names, torch.from_numpy(blob), scores
+
+
+@torch.no_grad()
+def embed_all(net, image_dir, names, lmk_info, no_align, batch_size, flip,
+              use_det_score, workers=8, fp16=True):
+    """Embed list ảnh -> dict name -> feat512. Dùng DataLoader đa worker + autocast fp16."""
+    name2feat = {}
+    n_view = 2 if flip else 1
+    ds = _ImgDataset(image_dir, names, lmk_info, no_align, flip, use_det_score)
+    loader = torch.utils.data.DataLoader(
+        ds, batch_size=batch_size, num_workers=workers, collate_fn=_collate,
+        pin_memory=True, persistent_workers=workers > 0)
+
+    n_bad = 0
+    for nms, blob, scores in tqdm(loader, desc="embed", unit="batch"):
+        if blob is None:
+            n_bad += batch_size
+            continue
+        t = blob.cuda(non_blocking=True)
+        t.div_(255).sub_(0.5).div_(0.5)
+        with torch.cuda.amp.autocast(enabled=fp16):
+            feat = net(t)
+        feat = feat.float().reshape(len(nms), n_view, -1).sum(axis=1).cpu().numpy()
+        for nm, sc, fe in zip(nms, scores, feat):
+            name2feat[nm] = fe * sc
+    print(f"[embed] xong {len(name2feat)} ảnh"
+          + (f" ({len(names)-len(name2feat)} ảnh hỏng/thiếu landmark bị bỏ)"
+             if len(name2feat) != len(names) else ""))
     return name2feat
 
 
@@ -182,6 +209,8 @@ def parse_args():
     ap.add_argument("--pairs", required=True, help="template_label.csv")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--batch-size", type=int, default=256)
+    ap.add_argument("--workers", type=int, default=8, help="số worker đọc/align ảnh song song")
+    ap.add_argument("--no-fp16", action="store_true", help="tắt fp16 autocast (mặc định BẬT)")
     ap.add_argument("--no-align", action="store_true",
                     help="ảnh đã 112x112 căn sẵn -> chỉ resize, không dùng landmark")
     ap.add_argument("--no-flip", action="store_true",
@@ -209,10 +238,14 @@ def main():
 
     # --- embed (theo đúng danh sách ảnh trong itm) ---
     names = itm["img_path"].astype(str).tolist()
+    torch.backends.cudnn.benchmark = True
     net = load_model(args.model, args.network)
-    print(f"[cfg] align={not args.no_align}  flip_test={not args.no_flip}  det_score={not args.no_det_score}")
+    print(f"[cfg] align={not args.no_align}  flip_test={not args.no_flip}  "
+          f"det_score={not args.no_det_score}  fp16={not args.no_fp16}  workers={args.workers}")
     name2feat = embed_all(net, args.image_dir, names, lmk_info, args.no_align,
-                          args.batch_size, flip=not args.no_flip, use_det_score=not args.no_det_score)
+                          args.batch_size, flip=not args.no_flip,
+                          use_det_score=not args.no_det_score,
+                          workers=args.workers, fp16=not args.no_fp16)
 
     # --- gom feats/templates/medias theo thứ tự itm (bỏ ảnh thiếu) ---
     feats, templates, medias = [], [], []
