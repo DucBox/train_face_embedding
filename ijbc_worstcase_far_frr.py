@@ -114,6 +114,45 @@ def gray_zone(t_lo, t_hi, scores, labels):
     print(f"    Review TONG     = {(gz_g+gz_i)/(P+N)*100:.2f}%  ({gz_g+gz_i:,} cap)")
 
 
+def full_table(scores, labels,
+               far_targets=(1e-1, 5e-2, 4e-2, 3e-2, 2e-2, 1e-2, 5e-3, 1e-3, 5e-4, 1e-4, 5e-5, 1e-5, 1e-6),
+               frr_targets=(1e-1, 5e-2, 4e-2, 3e-2, 2e-2, 1e-2, 5e-3, 1e-3, 5e-4, 1e-4)):
+    """In 2 bảng như notebook, nhưng chọn ngưỡng theo ĐÚNG ràng buộc (không 'gần nhất').
+
+    accept khi score >= threshold. Khi hạ ngưỡng: FAR tăng, FRR giảm (đơn điệu).
+    """
+    s = np.asarray(scores, float)
+    y = np.asarray(labels, int)
+    order = np.argsort(-s)                 # ngưỡng cao -> thấp
+    ss, yy = s[order], y[order]
+    P, N = int((y == 1).sum()), int((y == 0).sum())
+    TP = np.cumsum(yy == 1)
+    FP = np.cumsum(yy == 0)
+    FAR = FP / N                           # tại ngưỡng = ss[i]
+    FRR = (P - TP) / P
+
+    print("\n" + "=" * 58)
+    print("  FRR @ FAR cố định  (nới ngưỡng tới khi FAR vừa <= target)")
+    print("=" * 58)
+    print(f"{'Target FAR':>12} | {'Actual FAR':>11} | {'FRR':>9} | {'Threshold':>10}")
+    print("-" * 58)
+    for tgt in far_targets:
+        ok = np.where(FAR <= tgt)[0]       # FAR tăng theo i -> giữ i lớn nhất (FRR nhỏ nhất)
+        i = ok[-1] if len(ok) else 0
+        print(f"{tgt:12.1e} | {FAR[i]*100:10.4f}% | {FRR[i]*100:8.4f}% | {ss[i]:10.4f}")
+
+    print("\n" + "=" * 58)
+    print("  FAR @ FRR cố định  (siết ngưỡng tới khi FRR vừa <= target)")
+    print("=" * 58)
+    print(f"{'Target FRR':>12} | {'Actual FRR':>11} | {'FAR':>9} | {'Threshold':>10}")
+    print("-" * 58)
+    for tgt in frr_targets:
+        ok = np.where(FRR <= tgt)[0]       # FRR giảm theo i -> giữ i nhỏ nhất (FAR nhỏ nhất)
+        i = ok[0] if len(ok) else len(ss) - 1
+        print(f"{tgt:12.1e} | {FRR[i]*100:10.4f}% | {FAR[i]*100:8.4f}% | {ss[i]:10.4f}")
+    print("=" * 58 + "\n")
+
+
 def parse_args():
     ap = argparse.ArgumentParser(description="IJB-C worst-case 46k FAR/FRR")
     ap.add_argument("--save-dir", default="ijbc_worstcase_46k",
@@ -125,6 +164,7 @@ def parse_args():
     ap.add_argument("--threshold", type=float, default=None, help="1 ngưỡng -> FAR/FRR")
     ap.add_argument("--t-lo", type=float, default=None, help="ngưỡng dưới vùng xám")
     ap.add_argument("--t-hi", type=float, default=None, help="ngưỡng trên vùng xám")
+    ap.add_argument("--table", action="store_true", help="in 2 bảng FAR@FRR / FRR@FAR như notebook")
     return ap.parse_args()
 
 
@@ -148,6 +188,9 @@ def main():
     print(f"[set] total={len(scores):,}  genuine={(labels==1).sum():,}  impostor={(labels==0).sum():,}")
 
     did_eval = False
+    if args.table:
+        full_table(scores, labels)
+        did_eval = True
     if args.threshold is not None:
         print("[FAR/FRR @ 1 ngưỡng]")
         far_frr_at(args.threshold, scores, labels)
@@ -157,7 +200,7 @@ def main():
         gray_zone(args.t_lo, args.t_hi, scores, labels)
         did_eval = True
     if not did_eval:
-        print("(không truyền --threshold hoặc --t-lo/--t-hi nên chỉ build/load, không tính FAR/FRR)")
+        print("(không truyền --table/--threshold/--t-lo+--t-hi nên chỉ build/load)")
 
 
 if __name__ == "__main__":
