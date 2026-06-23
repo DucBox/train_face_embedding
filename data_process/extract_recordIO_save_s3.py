@@ -14,7 +14,7 @@ IDX_PATH = '/workspace/FaceNist/raw_data_processing/output_parquet/data_process/
 # S3 Config
 S3_ENDPOINT = "http://s3-data.cyberspace.vn"
 S3_ACCESS_KEY = "ttnt"
-S3_SECRET_KEY = "H?3o0nn4Irej"
+S3_SECRET_KEY = "<S3_SECRET_KEY>"
 BUCKET_NAME = 'ttnt'
 ROOT_PREFIX = 'cv/projects/face-recognition/public5m_reindex_image_folder'
 

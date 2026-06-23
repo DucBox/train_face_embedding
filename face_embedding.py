@@ -13,7 +13,7 @@ from backbones import get_model
 # --- CONFIGURATION ---
 S3_ENDPOINT = "http://s3-data.cyberspace.vn"
 S3_ACCESS_KEY = "ttnt"
-S3_SECRET_KEY = "H?3o0nn4Irej"
+S3_SECRET_KEY = "<S3_SECRET_KEY>"
 BUCKET_NAME = "ttnt"
 ROOT_PREFIX = "cv/processed-datasets/aligned_face_112_112"
 

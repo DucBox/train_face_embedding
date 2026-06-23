@@ -17,7 +17,7 @@ CLEAN_DATA_DIR = "/workspace/FaceNist/raw_data_processing/output_parquet/data_pr
 OFFSET_PARQUET = "/workspace/FaceNist/raw_data_processing/output_parquet/data_process/offset_map/offset_table_full_face_align.parquet"
 OUTPUT_DIR = "/workspace/FaceNist/raw_data_processing/output_parquet/data_process/face_embedding_normalize/train_data/version01_only_new_id_after_webface_public/crawl_v1_shards" 
 
-S3_CFG = { "endpoint": "http://s3-data.cyberspace.vn", "ak": "ttnt", "sk": "H?3o0nn4Irej", "bucket": "ttnt" }
+S3_CFG = { "endpoint": "http://s3-data.cyberspace.vn", "ak": "ttnt", "sk": "<S3_SECRET_KEY>", "bucket": "ttnt" }
 
 def process_shard(shard_id, data_rows, output_dir, progress_queue):
     """Worker chỉ lo tải và bắn tín hiệu tiến độ về Queue"""
