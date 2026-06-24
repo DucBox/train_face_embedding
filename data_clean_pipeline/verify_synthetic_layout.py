@@ -72,48 +72,52 @@ def main():
     print(f"[paths] synthetic = {s_rec}\n")
 
     pure, syn = _open(p_rec, p_idx), _open(s_rec, s_idx)
-    pure_keys, syn_keys = list(pure.keys), list(syn.keys)
-    max_pure = max(pure_keys)
-    print("=" * 60)
-    print(f"[counts] {p_name}: {len(pure_keys):,} records (max key {max_pure})")
-    print(f"[counts] {s_name}: {len(syn_keys):,} records (max key {max(syn_keys)})")
-    print("=" * 60)
+    # IMPORTANT: insightface .rec keys include per-identity HEADER records at the
+    # end (one per class), not just images. So len(keys) = images + num_classes + 1.
+    # The real IMAGE boundary is header.label[0]: images live at indices 1..label[0]-1.
+    hp0, _ = mx.recordio.unpack(pure.read_idx(0))
+    hs0, _ = mx.recordio.unpack(syn.read_idx(0))
+    assert hp0.flag > 0 and hs0.flag > 0, "expected header-format recs (flag>0)"
+    Hp, Hs = int(hp0.label[0]), int(hs0.label[0])   # image boundary (images = 1..H-1)
+    Np, Ns = Hp - 1, Hs - 1                          # actual image counts
 
-    syn_keyset = set(syn_keys)
-    assert len(syn_keys) >= len(pure_keys), "synthetic rec smaller than pure rec (!)"
-    missing = [k for k in pure_keys if k not in syn_keyset]
-    assert not missing, f"{len(missing)} pure keys absent from synthetic rec (not a prefix)"
+    print("=" * 60)
+    print(f"[counts] {p_name}: images={Np:,}  (raw idx records={len(list(pure.keys)):,} "
+          f"= images + per-id headers)")
+    print(f"[counts] {s_name}: images={Ns:,}  (raw idx records={len(list(syn.keys)):,})")
+    print("=" * 60)
+    assert Ns >= Np, "synthetic has fewer images than pure (!)"
 
-    # step 2: prefix integrity (label + bytes)
-    sample = random.sample(pure_keys, min(args.sample, len(pure_keys)))
+    # step 2: prefix integrity (label + bytes) over IMAGE indices 1..Np
+    sample = random.sample(range(1, Hp), min(args.sample, Np))
     mismatch_label = mismatch_bytes = 0
-    for k in tqdm(sample, desc="prefix-check (label+bytes)", unit="rec"):
+    for k in tqdm(sample, desc="prefix-check (label+bytes)", unit="img"):
         hp, ip = mx.recordio.unpack(pure.read_idx(k))
         hs, is_ = mx.recordio.unpack(syn.read_idx(k))
         mismatch_label += _label(hp) != _label(hs)
         mismatch_bytes += ip != is_
-    print(f"[prefix-check] sampled {len(sample):,}: "
+    print(f"[prefix-check] sampled {len(sample):,} image idxs: "
           f"label_mismatch={mismatch_label} bytes_mismatch={mismatch_bytes}")
     assert mismatch_label == 0 and mismatch_bytes == 0, \
         "train_synthetic is NOT (pure + appended synthetic) — revisit write_rec.syn_keys"
 
-    # step 3: synthetic count
-    tail = [k for k in syn_keys if k > max_pure]
-    n_syn = len(tail)
+    # step 3: synthetic count = images beyond the pure boundary (idx Hp .. Hs-1)
+    n_syn = Ns - Np
     print("\n" + "#" * 60)
-    print(f"#  SYNTHETIC IMAGE COUNT = {n_syn:,}   (keys > {max_pure})")
+    print(f"#  SYNTHETIC IMAGE COUNT = {n_syn:,}   (image idxs {Hp}..{Hs - 1})")
     if args.expected_synthetic is not None:
         ok = n_syn == args.expected_synthetic
         print(f"#  ground-truth expected = {args.expected_synthetic:,}  -> "
               f"{'PASS ✓' if ok else 'MISMATCH ✗'}")
     print("#" * 60 + "\n")
 
-    # step 4: tail parent labels
-    tail_sample = random.sample(tail, min(20, n_syn)) if tail else []
+    # step 4: sample synthetic parent labels (should be existing webface ids)
+    syn_idxs = range(Hp, Hs)
+    tail_sample = random.sample(list(syn_idxs), min(20, n_syn)) if n_syn else []
     labels = sorted({_label(mx.recordio.unpack(syn.read_idx(k))[0]) for k in tail_sample})
     print(f"[tail] sample parent labels: {labels}")
-    print(f"\n[RESULT] OK — pure prefix intact, {n_syn:,} synthetic appended after "
-          f"key {max_pure}. write_rec syn_keys = (k > {max_pure}).")
+    print(f"\n[RESULT] OK — pure prefix intact, {n_syn:,} synthetic at image idxs "
+          f"[{Hp}, {Hs}). write_rec synthetic = read_idx over range({Hp}, {Hs}).")
 
 
 if __name__ == "__main__":

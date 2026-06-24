@@ -126,10 +126,14 @@ def _run_real():
     pure = mx.recordio.MXIndexedRecordIO(
         os.path.join(CFG.rec_root, f"{CFG.rec_prefix[WEBFACE][0]}.idx"),
         os.path.join(CFG.rec_root, f"{CFG.rec_prefix[WEBFACE][0]}.rec"), "r")
-    # synthetic-only records = keys above the pure rec's max key (verified by
-    # verify_synthetic_layout.py: train_synthetic == pure prefix + appended tail).
-    max_pure = max(pure.keys)
-    syn_keys = [k for k in syn.keys if k > max_pure]
+    # synthetic-only records = image indices BEYOND the pure image boundary.
+    # insightface .rec keys include per-id header records at the end, so we use
+    # header.label[0] (the image boundary: images live at 1..label[0]-1), NOT
+    # raw keys. Pure images = 1..Hp-1; synthetic-only = Hp..Hs-1.
+    # (verified by verify_synthetic_layout.py: train_synthetic == pure prefix + tail)
+    Hp = int(mx.recordio.unpack(pure.read_idx(0))[0].label[0])
+    Hs = int(mx.recordio.unpack(syn.read_idx(0))[0].label[0])
+    syn_keys = range(Hp, Hs)
     import numbers
     for k in tqdm(syn_keys, desc="write synthetic", unit="img"):
         h, img = mx.recordio.unpack(syn.read_idx(k))
