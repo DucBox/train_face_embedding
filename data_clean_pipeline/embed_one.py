@@ -5,11 +5,10 @@ eyeball the vectors against a ground truth and confirm the embed flow is correct
     python embed_one.py --src crawl   --pid 11
     python embed_one.py --src webface --pid 0 --out /tmp/wf0.csv
 
-It reproduces EXACTLY the preprocessing of that source's real embed script:
-  - rec sources (webface/public): mx.image.imdecode (RGB) -> ToTensor -> Normalize(0.5)
-    [matches embed_rec.py]
-  - crawl (S3 tar): cv2 BGR -> resize112 -> BGR2RGB -> /255 -0.5 /0.5
-    [matches embed_s3.py]
+Preprocessing: ALL sources use the cv2/S3 style (decode BGR -> resize112 ->
+BGR2RGB -> /255 -0.5 /0.5), i.e. rec images are decoded with cv2 on their raw
+jpeg bytes too (not mx.image.imdecode/torchvision). Logically identical to the
+training transform (RGB, /255, (x-0.5)/0.5); only the JPEG decoder differs.
 
 CSV columns: img_key, embedding, embedding_normalized  (512-d vectors, space-joined),
 plus norm_raw. Uses CFG (model_weight/network/rec_root/S3). Real-only (torch +
@@ -35,6 +34,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import CFG, SOURCES, WEBFACE, PUBLIC, CRAWL
 
 
+def _prep(raw: bytes):
+    """s3/cv2-style preprocessing on raw jpeg bytes -> CHW float tensor in [-1,1].
+    Used for BOTH rec and crawl sources so the embed path is uniform."""
+    import cv2
+    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)  # BGR
+    if img is None:
+        return None
+    img = cv2.cvtColor(cv2.resize(img, (112, 112)), cv2.COLOR_BGR2RGB)
+    return torch.from_numpy(np.transpose(img, (2, 0, 1))).float().div_(255).sub_(0.5).div_(0.5)
+
+
 def _net():
     from backbones import get_model
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -44,11 +54,9 @@ def _net():
 
 
 def _imgs_rec(src, pid, max_scan):
-    """Scan src's rec(s), collect (img_key, RGB uint8 HxWxC) for label == pid."""
+    """Scan src's rec(s), collect (img_key, CHW tensor) for label == pid.
+    Decodes the raw jpeg bytes with cv2 (_prep), same as the crawl path."""
     import mxnet as mx
-    from torchvision import transforms
-    tfm = transforms.Compose([transforms.ToPILImage(), transforms.ToTensor(),
-                              transforms.Normalize([0.5] * 3, [0.5] * 3)])
     out = []
     for prefix in CFG.rec_prefix[src]:
         rec = mx.recordio.MXIndexedRecordIO(
@@ -62,14 +70,14 @@ def _imgs_rec(src, pid, max_scan):
             h, img = mx.recordio.unpack(rec.read_idx(int(k)))
             lbl = int(h.label if isinstance(h.label, numbers.Number) else h.label[0])
             if lbl == pid:
-                rgb = mx.image.imdecode(img).asnumpy()
-                out.append((f"{prefix}:{k}", tfm(rgb)))
+                t = _prep(img)
+                if t is not None:
+                    out.append((f"{prefix}:{k}", t))
     return out
 
 
 def _imgs_crawl(pid):
     """GET the person's tar from S3, return (member_name, CHW float tensor)."""
-    import cv2
     import boto3
     s3 = boto3.client("s3", endpoint_url=CFG.s3_endpoint,
                       aws_access_key_id=CFG.s3_access_key,
@@ -84,13 +92,9 @@ def _imgs_crawl(pid):
         for m in tar.getmembers():
             if not m.isfile():
                 continue
-            img = cv2.imdecode(np.frombuffer(tar.extractfile(m).read(), np.uint8),
-                               cv2.IMREAD_COLOR)
-            if img is None:
-                continue
-            img = cv2.cvtColor(cv2.resize(img, (112, 112)), cv2.COLOR_BGR2RGB)
-            t = torch.from_numpy(np.transpose(img, (2, 0, 1))).float().div_(255).sub_(0.5).div_(0.5)
-            out.append((f"{key}/{m.name}", t))
+            t = _prep(tar.extractfile(m).read())
+            if t is not None:
+                out.append((f"{key}/{m.name}", t))
     return out
 
 
