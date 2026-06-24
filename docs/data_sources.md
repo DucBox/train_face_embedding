@@ -7,7 +7,7 @@ Identity (class) IDs are allocated as one global, contiguous range across all
 
 | Source | File prefix | Has header? | ID range (this run) | Count | Origin |
 |---|---|---|---|---|---|
-| webface | `train_synthetic.rec`/`.idx` | yes (`header.flag > 0`) | ~0 – 2.1M | ~2.1M ids | WebFace42M + per-id 3DDFA-generated synthetic images appended at the end of each id's image list |
+| webface | `train_synthetic.rec`/`.idx` | yes (`header.flag > 0`) | ~0 – 2.1M | ~2.1M ids | WebFace42M (pure = `train.rec`) with ALL 3DDFA-generated synthetic images appended as ONE block at the end of the file, i.e. `train_synthetic.rec = [all real images][all synthetic images]` (NOT interleaved per id) |
 | public | `train_public.rec`/`.idx` | yes (`header.flag > 0`) | ~2.1M – 2.6M | ~500K ids | public face dataset |
 | crawl | `train_1.rec` … `train_{num_rec_files-1}.rec` | no (`header.flag <= 0`) | ~2.6M – 3.6M | ~1M ids | internally crawled data, split across `num_rec_files - 1` shards |
 
@@ -41,6 +41,13 @@ Per-image labels are read from the record body itself (`header.label` in
 `__getitem__`, [dataset.py:292](../dataset.py)), not from the file-level
 header — the file-level header only tells you how many images / how to find
 them.
+
+**Counting gotcha:** for header recs, `imgrec.keys` is NOT just the images — the
+insightface format also stores one per-identity HEADER record per class at the
+end of the `.idx`. So `len(imgrec.keys) = 1 (file header) + num_images +
+num_classes`. For pure WebFace42M that is `1 + ~42,473,115 + ~2,058,464 ≈
+44,531,581`, not ~42.47M. Always use `header.label[0]` as the image boundary
+(images live at indices `1 .. header.label[0]-1`); never `len(keys)` / `max(keys)`.
 
 ## Known data issue: duplicate identities in `webface`
 
