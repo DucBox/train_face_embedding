@@ -47,12 +47,21 @@ from tqdm import tqdm
 
 
 def load_embeddings(path):
-    """-> (df, emb[N,D] float32 L2-normalized)."""
+    """-> (df, emb[N,D] float32 L2-normalized).
+
+    embed_cfpw.py already L2-normalizes, nhưng vẫn normalize lại ở đây cho chắc:
+    medoid / nearest-id / sim_to_host đều dựa trên dot = cosine nên embedding PHẢI
+    là unit-norm thì số mới đúng.
+    """
     df = pl.read_parquet(path)
     emb = np.asarray(df["embedding"].to_numpy(), dtype=np.float32)
     if emb.ndim == 1:  # object array of lists -> stack
         emb = np.stack([np.asarray(v, dtype=np.float32) for v in df["embedding"].to_list()])
-    return df, np.ascontiguousarray(emb)
+    emb = np.ascontiguousarray(emb, dtype=np.float32)
+    norm = np.linalg.norm(emb, axis=1, keepdims=True)
+    norm[norm == 0] = 1e-12
+    emb = emb / norm
+    return df, emb
 
 
 def compute_medoids(emb, id_rows):
