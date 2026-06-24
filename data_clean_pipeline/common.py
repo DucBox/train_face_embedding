@@ -58,10 +58,25 @@ def iter_parquet(dir_path: str, columns=None) -> Iterable[Tuple[str, pl.DataFram
 
 
 def emb_matrix(df: pl.DataFrame, col: str) -> np.ndarray:
-    """List-column -> contiguous float32 (N, D)."""
+    """Embedding column (float16 fixed-size-list OR float list) -> float32 (N, D)."""
     if df.height == 0:
         return np.zeros((0, 0), dtype=np.float32)
     return np.asarray(df[col].to_list(), dtype=np.float32)
+
+
+def write_emb_parquet(path: str, meta_df: pl.DataFrame, emb: np.ndarray, emb_col: str):
+    """Write meta columns + the embedding as a fixed_size_list<float16> column.
+    float16 is ~4x smaller on disk than the default python-float (Float64) list
+    polars infers, with negligible effect on cosine DBSCAN / centroids. Read back
+    via emb_matrix() which upcasts to float32. emb: (N, D) array."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    emb = np.ascontiguousarray(np.asarray(emb, dtype=np.float16))
+    n, d = emb.shape
+    tbl = meta_df.to_arrow().append_column(
+        emb_col,
+        pa.FixedSizeListArray.from_arrays(pa.array(emb.reshape(-1), type=pa.float16()), d))
+    pq.write_table(tbl, path)
 
 
 # --------------------------------------------------------------------------- #

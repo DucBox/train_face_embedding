@@ -22,7 +22,7 @@ import polars as pl
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common import COL_ID, COL_SRC, COL_KEY, COL_EMB, log
+from common import COL_ID, COL_SRC, COL_KEY, COL_EMB, write_emb_parquet, log
 from config import CFG, SOURCES
 
 
@@ -80,17 +80,18 @@ def run(src: str):
     net.load_state_dict(__import__("torch").load(CFG.model_weight, map_location="cpu"),
                         strict=False)
 
-    buf, rows, chunk = [], 0, 0
+    buf_id, buf_key, buf_emb, rows, chunk = [], [], [], 0, 0
     import torch as T
 
     def flush():
-        nonlocal buf, rows, chunk
-        if not buf:
+        nonlocal buf_id, buf_key, buf_emb, rows, chunk
+        if not buf_id:
             return
         fp = os.path.join(out_dir, f"part-rank{rank}-{chunk:04d}.parquet")
         if not os.path.exists(fp):
-            pl.DataFrame(buf).write_parquet(fp)
-        buf, rows = [], 0
+            meta = pl.DataFrame({COL_ID: buf_id, COL_SRC: [src] * len(buf_id), COL_KEY: buf_key})
+            write_emb_parquet(fp, meta, np.concatenate(buf_emb, axis=0), COL_EMB)
+        buf_id, buf_key, buf_emb, rows = [], [], [], 0
         chunk += 1
 
     done = 0
@@ -98,8 +99,9 @@ def run(src: str):
     with T.no_grad():
         for imgs, lbls, keys in pbar:
             feat = net(imgs.to(device)).cpu().numpy().astype(np.float32)
-            for k, lb, fe in zip(keys, lbls.numpy(), feat):
-                buf.append({COL_ID: int(lb), COL_SRC: src, COL_KEY: k, COL_EMB: fe.tolist()})
+            buf_emb.append(feat)
+            buf_id.extend(int(x) for x in lbls.numpy())
+            buf_key.extend(keys)
             rows += len(keys)
             done += len(keys)
             if rows >= CFG.embed_flush_rows:
