@@ -6,7 +6,8 @@ trainer (get_dataloader concatenates sources) needs no change beyond num_classes
 The set of images to write = the post-DBSCAN images (stage 03 output) whose final
 label != -1, with the label replaced by label_map (stage 08). Bytes come from:
   - webface/public/synthetic  -> source .rec via read_idx (img_key="prefix:ridx")
-  - crawl                     -> S3 byte fetch (img_key=aligned_s3_path)
+  - crawl  -> per-person tar GET'd once from S3, wanted members extracted
+              (img_key="{tar_path}/{member}"); no offset_map needed
 
 Outputs:
   train_synthetic_clean.rec  : webface-pure imgs + synthetic imgs (remapped)
@@ -18,7 +19,9 @@ asserts id contiguity / coverage / counts against meta instead of packing bytes.
 """
 from __future__ import annotations
 
+import io
 import os
+import tarfile
 
 import polars as pl
 from tqdm import tqdm
@@ -149,35 +152,61 @@ def _run_real():
 
 
 def _write_crawl(lmap):
+    """RAM-safe crawl writer: group surviving images by their per-person tar,
+    GET each tar ONCE from S3 and extract only the wanted members. No 197M-row
+    offset_map dict, no per-image Range request. img_key = "{tar_path}/{member}"
+    and member_name has no '/', so split on the single '.tar/' delimiter."""
     import mxnet as mx
     import boto3
 
-    om = pl.read_parquet(CFG.offset_map_path).with_columns(
-        (pl.col("tar_path") + "/" + pl.col("member_name")).alias("img_key"))
-    om = dict(zip(om["img_key"].to_list(),
-                  zip(om["tar_path"].to_list(), om["start_byte"].to_list(),
-                      om["length"].to_list())))
+    # 1) surviving crawl images -> (tar_path, member_name, final_id), streamed.
+    log("[write_rec] collecting surviving crawl images...")
+    parts = []
+    for fp in tqdm(list_parquet(CFG.dir_dbscan(CRAWL)), desc="scan crawl", unit="shard"):
+        df = pl.read_parquet(fp, columns=[COL_ID, COL_KEY])
+        df = df.with_columns(
+            pl.col(COL_ID).replace_strict(lmap, default=-1).alias("final_id")
+        ).filter(pl.col("final_id") >= 0)
+        if df.height == 0:
+            continue
+        sp = pl.col(COL_KEY).str.split_exact(".tar/", 1)
+        df = df.with_columns([(sp.struct.field("field_0") + ".tar").alias("tar_path"),
+                              sp.struct.field("field_1").alias("member_name")])
+        parts.append(df.select(["tar_path", "member_name", "final_id"]))
+    if not parts:
+        log("[write_rec] crawl: nothing to write")
+        return
+
+    # 2) group by tar (one GET per person tar); round-robin tars across shards.
+    grouped = pl.concat(parts).group_by("tar_path").agg(
+        [pl.col("member_name"), pl.col("final_id")])
+    tars = grouped.rows()  # [(tar_path, [members], [finals]), ...]
+    log(f"[write_rec] crawl: {len(tars):,} tars, "
+        f"{sum(len(m) for _, m, _ in tars):,} imgs over {CFG.crawl_out_shards} shards")
+
     s3 = boto3.client("s3", endpoint_url=CFG.s3_endpoint,
                       aws_access_key_id=CFG.s3_access_key,
                       aws_secret_access_key=CFG.s3_secret_key)
-    log("[write_rec] scanning surviving crawl images...")
-    rows = list(_iter_surviving(CRAWL, lmap))
-    shards = [rows[i::CFG.crawl_out_shards] for i in range(CFG.crawl_out_shards)]
-    for sid, srows in enumerate(tqdm(shards, desc="crawl shards", unit="shard")):
+    for sid in tqdm(range(CFG.crawl_out_shards), desc="crawl shards", unit="shard"):
+        srows = tars[sid::CFG.crawl_out_shards]
         out = os.path.join(CFG.rec_out_dir, f"train_crawl_{sid:03d}")
         w = mx.recordio.MXIndexedRecordIO(out + ".idx", out + ".rec", "w")
-        for i, (final, key) in enumerate(
-                tqdm(srows, desc=f"  shard {sid:03d}", unit="img", leave=False)):
-            meta = om.get(key)
-            if meta is None:
-                continue
-            tar, start, length = meta
-            body = s3.get_object(Bucket=CFG.s3_bucket, Key=tar,
-                                 Range=f"bytes={start}-{start + length - 1}")["Body"].read()
-            hdr = mx.recordio.IRHeader(0, float(final), i, 0)
-            w.write_idx(i, mx.recordio.pack(hdr, body))
+        i = 0
+        for tar_path, members, finals in tqdm(srows, desc=f"  shard {sid:03d}",
+                                              unit="tar", leave=False):
+            wanted = dict(zip(members, finals))
+            try:
+                body = s3.get_object(Bucket=CFG.s3_bucket, Key=tar_path)["Body"].read()
+                with tarfile.open(fileobj=io.BytesIO(body), mode="r") as tar:
+                    for m in tar.getmembers():
+                        if m.name in wanted:
+                            hdr = mx.recordio.IRHeader(0, float(wanted[m.name]), i, 0)
+                            w.write_idx(i, mx.recordio.pack(hdr, tar.extractfile(m).read()))
+                            i += 1
+            except Exception as e:
+                log(f"[write_rec] crawl tar {tar_path} ERR: {e}")
         w.close()
-    log(f"[write_rec] crawl: {len(rows):,} imgs over {CFG.crawl_out_shards} shards")
+    log("[write_rec] crawl DONE")
 
 
 def run():
