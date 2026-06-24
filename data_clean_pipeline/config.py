@@ -64,13 +64,14 @@ class Config:
 
     # --- crawl source (197M aligned crops on S3, 1 tar / person) ---
     s3_endpoint: str = os.environ.get("S3_ENDPOINT", "http://s3-data.cyberspace.vn")
-    s3_bucket: str = os.environ.get("S3_BUCKET", "ttnt")
+    s3_bucket: str = os.environ.get("S3_BUCKET", "ttnt-data")   # confirmed via download_person.py
     s3_access_key: str = os.environ.get("S3_ACCESS_KEY", "")
     s3_secret_key: str = os.environ.get("S3_SECRET_KEY", "")
     # prefix containing per-person tars: {prefix}/person_{start}_{end}/person_{pid:07d}.tar
+    # confirmed: aligned 112x112 crawl crops live here, ids from 0, shard folders person_0_999.
     crawl_s3_prefix: str = os.environ.get(
-        "CRAWL_S3_PREFIX", "cv/crawled-datasets/face-google-search")
-    crawl_shard_size: int = 10000          # ids per shard folder (matches build)
+        "CRAWL_S3_PREFIX", "cv/processed-datasets/aligned_face_112_112")
+    crawl_shard_size: int = 1000           # folder person_{start}_{start+999}
     # offset_map parquet: tar_path, member_name, start_byte, length (create_offset_map.py)
     offset_map_path: str = os.environ.get("OFFSET_MAP", "/path/to/offset_table.parquet")
 
