@@ -56,15 +56,50 @@ _SRC = np.array([
 _SRC[:, 0] += 8.0
 
 
-def load_model(model_path, network):
-    print(f"[model] loading {network} <- {model_path}")
-    net = get_model(network, dropout=0, fp16=False)
-    state = torch.load(model_path, map_location="cpu")
-    if isinstance(state, dict) and "state_dict" in state:
-        state = state["state_dict"]
-    net.load_state_dict(state)
-    net = net.cuda().eval()
-    return net
+class TorchBackend:
+    """Chạy model PyTorch trên GPU + autocast fp16 (y hệt flow cũ)."""
+    name = "torch"
+
+    def __init__(self, model_path, network, fp16=True):
+        print(f"[model] torch: loading {network} <- {model_path}")
+        net = get_model(network, dropout=0, fp16=False)
+        state = torch.load(model_path, map_location="cpu")
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        net.load_state_dict(state)
+        self.net = net.cuda().eval()
+        self.fp16 = fp16
+
+    @torch.no_grad()
+    def infer(self, blob):
+        """blob: torch.Tensor (M,3,112,112) raw [0,255] -> feat (M,512) numpy."""
+        t = blob.cuda(non_blocking=True)
+        t.div_(255).sub_(0.5).div_(0.5)
+        with torch.cuda.amp.autocast(enabled=self.fp16):
+            feat = self.net(t)
+        return feat.float().cpu().numpy()
+
+
+class OnnxBackend:
+    """Chạy model ONNX qua onnxruntime. Tiền xử lý GIỐNG torch: (x/255-0.5)/0.5, RGB CHW."""
+    name = "onnx"
+
+    def __init__(self, onnx_path, cpu=False):
+        import onnxruntime as ort
+        providers = (["CPUExecutionProvider"] if cpu
+                     else ["CUDAExecutionProvider", "CPUExecutionProvider"])
+        print(f"[model] onnx: loading {onnx_path}  providers={providers}")
+        self.sess = ort.InferenceSession(onnx_path, providers=providers)
+        self.in_name = self.sess.get_inputs()[0].name
+        self.out_name = self.sess.get_outputs()[0].name
+        print(f"[model] onnx in={self.in_name}{self.sess.get_inputs()[0].shape} "
+              f"out={self.out_name} actual_providers={self.sess.get_providers()}")
+
+    def infer(self, blob):
+        """blob: torch.Tensor/np (M,3,112,112) raw [0,255] -> feat (M,512) numpy."""
+        x = blob.numpy() if hasattr(blob, "numpy") else np.asarray(blob)
+        x = ((x.astype(np.float32) / 255.0) - 0.5) / 0.5
+        return self.sess.run([self.out_name], {self.in_name: x})[0]
 
 
 def align_112(img, lmk5):
@@ -140,10 +175,9 @@ def _collate(batch):
     return names, torch.from_numpy(blob), scores
 
 
-@torch.no_grad()
-def embed_all(net, image_dir, names, lmk_info, no_align, batch_size, flip,
-              use_det_score, workers=8, fp16=True):
-    """Embed list ảnh -> dict name -> feat512. Dùng DataLoader đa worker + autocast fp16."""
+def embed_all(backend, image_dir, names, lmk_info, no_align, batch_size, flip,
+              use_det_score, workers=8):
+    """Embed list ảnh -> dict name -> feat512. DataLoader đa worker; forward qua backend (torch/onnx)."""
     name2feat = {}
     n_view = 2 if flip else 1
     ds = _ImgDataset(image_dir, names, lmk_info, no_align, flip, use_det_score)
@@ -151,16 +185,11 @@ def embed_all(net, image_dir, names, lmk_info, no_align, batch_size, flip,
         ds, batch_size=batch_size, num_workers=workers, collate_fn=_collate,
         pin_memory=True, persistent_workers=workers > 0)
 
-    n_bad = 0
     for nms, blob, scores in tqdm(loader, desc="embed", unit="batch"):
         if blob is None:
-            n_bad += batch_size
             continue
-        t = blob.cuda(non_blocking=True)
-        t.div_(255).sub_(0.5).div_(0.5)
-        with torch.cuda.amp.autocast(enabled=fp16):
-            feat = net(t)
-        feat = feat.float().reshape(len(nms), n_view, -1).sum(axis=1).cpu().numpy()
+        feat = backend.infer(blob)                                  # (n_view*B, 512) numpy
+        feat = feat.reshape(len(nms), n_view, -1).sum(axis=1)       # gộp orig+flip
         for nm, sc, fe in zip(nms, scores, feat):
             name2feat[nm] = fe * sc
     print(f"[embed] xong {len(name2feat)} ảnh"
@@ -201,8 +230,10 @@ def score_pairs(tfeat, uniq_t, p1, p2, batch=200000):
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Sinh pred/label/p1_p2 cho IJB-C custom")
-    ap.add_argument("--model", required=True, help="checkpoint model (.pt)")
-    ap.add_argument("--network", default="vit_l")
+    ap.add_argument("--model", default="", help="checkpoint PyTorch (.pt) - dùng nếu không có --onnx")
+    ap.add_argument("--network", default="vit_l", help="kiến trúc cho backend torch")
+    ap.add_argument("--onnx", default="", help="file .onnx - bật backend ONNX thay cho torch")
+    ap.add_argument("--onnx-cpu", action="store_true", help="ép ONNX chạy CPU (mặc định ưu tiên CUDA)")
     ap.add_argument("--image-dir", required=True, help="thư mục loose_crop")
     ap.add_argument("--landmark-file", default="", help="ijbc_name_5pts_score.txt (cần nếu align)")
     ap.add_argument("--itm", required=True, help="image_template_media.csv")
@@ -236,16 +267,22 @@ def main():
     if not args.no_align and not args.landmark_file:
         raise SystemExit("Cần --landmark-file để align (hoặc --no-align nếu ảnh đã 112x112).")
 
+    # --- chọn backend: onnx nếu có --onnx, ngược lại torch ---
+    if args.onnx:
+        backend = OnnxBackend(args.onnx, cpu=args.onnx_cpu)
+    elif args.model:
+        torch.backends.cudnn.benchmark = True
+        backend = TorchBackend(args.model, args.network, fp16=not args.no_fp16)
+    else:
+        raise SystemExit("Cần --model (PyTorch) hoặc --onnx.")
+
     # --- embed (theo đúng danh sách ảnh trong itm) ---
     names = itm["img_path"].astype(str).tolist()
-    torch.backends.cudnn.benchmark = True
-    net = load_model(args.model, args.network)
-    print(f"[cfg] align={not args.no_align}  flip_test={not args.no_flip}  "
-          f"det_score={not args.no_det_score}  fp16={not args.no_fp16}  workers={args.workers}")
-    name2feat = embed_all(net, args.image_dir, names, lmk_info, args.no_align,
+    print(f"[cfg] backend={backend.name}  align={not args.no_align}  flip_test={not args.no_flip}  "
+          f"det_score={not args.no_det_score}  workers={args.workers}")
+    name2feat = embed_all(backend, args.image_dir, names, lmk_info, args.no_align,
                           args.batch_size, flip=not args.no_flip,
-                          use_det_score=not args.no_det_score,
-                          workers=args.workers, fp16=not args.no_fp16)
+                          use_det_score=not args.no_det_score, workers=args.workers)
 
     # --- gom feats/templates/medias theo thứ tự itm (bỏ ảnh thiếu) ---
     feats, templates, medias = [], [], []
