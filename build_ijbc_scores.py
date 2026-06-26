@@ -92,14 +92,38 @@ class OnnxBackend:
         self.sess = ort.InferenceSession(onnx_path, providers=providers)
         self.in_name = self.sess.get_inputs()[0].name
         self.out_name = self.sess.get_outputs()[0].name
-        print(f"[model] onnx in={self.in_name}{self.sess.get_inputs()[0].shape} "
-              f"out={self.out_name} actual_providers={self.sess.get_providers()}")
+        in_shape = self.sess.get_inputs()[0].shape
+        # batch cố định nếu dim 0 là int (vd 1); None nếu động ('batch'/-1/str)
+        self.fixed_batch = in_shape[0] if isinstance(in_shape[0], int) and in_shape[0] > 0 else None
+        actual = self.sess.get_providers()
+        print(f"[model] onnx in={self.in_name}{in_shape} out={self.out_name} "
+              f"actual_providers={actual}  fixed_batch={self.fixed_batch}")
+        if "CUDAExecutionProvider" not in actual and not cpu:
+            print("[WARN] onnxruntime chạy CPU (thiếu onnxruntime-gpu) -> sẽ RẤT chậm với 469k ảnh.")
+        if self.fixed_batch is not None:
+            print(f"[WARN] model fix batch={self.fixed_batch} -> chạy theo chunk cố định. "
+                  f"Nên export lại ONNX với dynamic axis batch để nhanh hơn.")
+
+    def _run(self, x):
+        return self.sess.run([self.out_name], {self.in_name: x})[0]
 
     def infer(self, blob):
         """blob: torch.Tensor/np (M,3,112,112) raw [0,255] -> feat (M,512) numpy."""
         x = blob.numpy() if hasattr(blob, "numpy") else np.asarray(blob)
         x = ((x.astype(np.float32) / 255.0) - 0.5) / 0.5
-        return self.sess.run([self.out_name], {self.in_name: x})[0]
+        M = x.shape[0]
+        if self.fixed_batch is None or self.fixed_batch == M:
+            return self._run(x)
+        # model fix batch -> chạy từng chunk, pad chunk cuối rồi cắt lại
+        b = self.fixed_batch
+        outs = []
+        for s in range(0, M, b):
+            chunk = x[s:s + b]
+            n = chunk.shape[0]
+            if n < b:  # pad cho đủ batch cố định
+                chunk = np.concatenate([chunk, np.zeros((b - n,) + chunk.shape[1:], np.float32)], 0)
+            outs.append(self._run(chunk)[:n])
+        return np.concatenate(outs, 0)
 
 
 def align_112(img, lmk5):
