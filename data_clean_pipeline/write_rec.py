@@ -192,9 +192,15 @@ def _write_crawl(lmap):
                       aws_access_key_id=CFG.s3_access_key,
                       aws_secret_access_key=CFG.s3_secret_key)
     for sid in tqdm(range(CFG.crawl_out_shards), desc="crawl shards", unit="shard"):
-        srows = tars[sid::CFG.crawl_out_shards]
         out = os.path.join(CFG.rec_out_dir, f"train_crawl_{sid:03d}")
-        w = mx.recordio.MXIndexedRecordIO(out + ".idx", out + ".rec", "w")
+        # RESUME: a completed shard has both final files. Skip it so a crash mid-
+        # crawl (the long S3 pole) doesn't redo finished shards. A crashed shard
+        # leaves only .tmp files (ignored); it gets rewritten on re-run.
+        if os.path.exists(out + ".rec") and os.path.exists(out + ".idx"):
+            continue
+        srows = tars[sid::CFG.crawl_out_shards]
+        tmp = out + ".tmp"
+        w = mx.recordio.MXIndexedRecordIO(tmp + ".idx", tmp + ".rec", "w")
         i = 0
         for tar_path, members, finals in tqdm(srows, desc=f"  shard {sid:03d}",
                                               unit="tar", leave=False):
@@ -210,6 +216,8 @@ def _write_crawl(lmap):
             except Exception as e:
                 log(f"[write_rec] crawl tar {tar_path} ERR: {e}")
         w.close()
+        os.rename(tmp + ".rec", out + ".rec")   # atomic-ish: mark shard complete
+        os.rename(tmp + ".idx", out + ".idx")
     log("[write_rec] crawl DONE")
 
 
