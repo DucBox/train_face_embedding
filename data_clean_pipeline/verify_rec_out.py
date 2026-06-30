@@ -70,6 +70,37 @@ def _count_rec(args):
     return os.path.basename(path), total, counts, oor
 
 
+BUCKETS = [
+    (3,    5),
+    (6,    10),
+    (11,   20),
+    (21,   50),
+    (51,   100),
+    (101,  200),
+    (201,  500),
+    (501,  1000),
+    (1001, 2000),
+    (2001, 5000),
+    (5001, 10000),
+    (10001, None),   # 10000+
+]
+LARGE_ID_THRESHOLD = 1000
+
+
+def _bucket_label(lo, hi):
+    return f"{lo}-{hi}" if hi else f"{lo}+"
+
+
+def _distribution_buckets(cp):
+    result = {}
+    for lo, hi in BUCKETS:
+        mask = (cp >= lo) & (cp <= hi if hi else True)
+        n_ids = int(mask.sum())
+        n_imgs = int(cp[mask].sum())
+        result[_bucket_label(lo, hi)] = {"ids": n_ids, "imgs": n_imgs}
+    return result
+
+
 def _percentiles(counts_present):
     p = np.percentile(counts_present, [1, 25, 50, 75, 99])
     return {"p1": float(p[0]), "p25": float(p[1]), "median": float(p[2]),
@@ -128,6 +159,23 @@ def run():
         f"min={dist['min']} max={dist['max']} mean={dist['mean']:.2f} "
         f"median={dist['median']:.0f} p1={dist['p1']:.0f} p99={dist['p99']:.0f}")
 
+    buckets = _distribution_buckets(cp)
+    log("[verify_rec_out] image-count distribution:")
+    for label, v in buckets.items():
+        pct_ids = 100.0 * v["ids"] / len(cp) if len(cp) else 0
+        pct_imgs = 100.0 * v["imgs"] / total_images if total_images else 0
+        log(f"  {label:>12} imgs/id : {v['ids']:>10,} ids ({pct_ids:5.2f}%)  "
+            f"{v['imgs']:>12,} imgs ({pct_imgs:5.2f}%)")
+
+    large_ids = np.where(counts > LARGE_ID_THRESHOLD)[0]
+    large_path = os.path.join(CFG.work_dir, "large_ids.json")
+    large_data = [{"final_id": int(fid), "img_count": int(counts[fid])}
+                  for fid in large_ids]
+    large_data.sort(key=lambda x: -x["img_count"])
+    json.dump(large_data, open(large_path, "w"), indent=2)
+    log(f"[verify_rec_out] ids with >{LARGE_ID_THRESHOLD} imgs: "
+        f"{len(large_ids):,} ids -> {large_path}")
+
     block_stats = {}
     for src in SOURCES:
         if src not in block_ranges:
@@ -152,7 +200,9 @@ def run():
     report = {"total_images": int(total_images), "out_of_range": int(total_oor),
               "num_classes": K, "ids_present": int(present.sum()),
               "ids_missing": int(len(missing)), "missing_sample": missing[:200].tolist(),
-              "distribution_overall": dist, "distribution_per_source": block_stats,
+              "distribution_overall": dist, "distribution_buckets": buckets,
+              "large_ids_count": len(large_ids),
+              "distribution_per_source": block_stats,
               "per_file_counts": per_file}
     out_path = os.path.join(CFG.work_dir, "verify_rec_out_report.json")
     json.dump(report, open(out_path, "w"), indent=2)
