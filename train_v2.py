@@ -214,21 +214,10 @@ def main(args):
     cfg.warmup_step = steps_per_epoch * cfg.warmup_epoch
     cfg.total_step = steps_per_epoch * cfg.num_epoch
 
-    pco_kwargs = dict(
-        pco_stage=cfg.pco_stage,
-        pco_m1=cfg.pco_proto_m1,
-        pco_m2=cfg.pco_proto_m2,
-        pco_scale=cfg.pco_scale,
-        pco_update_center_stage3=cfg.pco_update_center_stage3,
-    )
-    if local_rank == 0:
-        print(f"[PCO] stage={cfg.pco_stage} m1={cfg.pco_proto_m1} m2={cfg.pco_proto_m2} "
-              f"scale={cfg.pco_scale} sample_rate={cfg.sample_rate}")
-
     if cfg.optimizer == "sgd":
         module_partial_fc = PartialFC_V2(
             margin_loss, cfg.embedding_size, cfg.num_classes,
-            cfg.sample_rate, False, **pco_kwargs)
+            cfg.sample_rate, False)
         module_partial_fc.train().cuda()
         # TODO the params of partial fc must be last in the params list
         opt = torch.optim.SGD(
@@ -238,7 +227,7 @@ def main(args):
     elif cfg.optimizer == "adamw":
         module_partial_fc = PartialFC_V2(
             margin_loss, cfg.embedding_size, cfg.num_classes,
-            cfg.sample_rate, False, **pco_kwargs)
+            cfg.sample_rate, False)
         module_partial_fc.train().cuda()
         opt = torch.optim.AdamW(
             params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}],
@@ -258,9 +247,7 @@ def main(args):
         start_epoch = dict_checkpoint["epoch"]
         global_step = dict_checkpoint["global_step"]
         backbone.module.load_state_dict(dict_checkpoint["state_dict_backbone"])
-        # strict=False: the PCO feature-expectation bank may be absent (e.g. resuming a stage-1
-        # run) or extra; missing buffers keep their fresh init and get filled on first batch.
-        module_partial_fc.load_state_dict(dict_checkpoint["state_dict_softmax_fc"], strict=False)
+        module_partial_fc.load_state_dict(dict_checkpoint["state_dict_softmax_fc"])
         opt.load_state_dict(dict_checkpoint["state_optimizer"])
         lr_scheduler.load_state_dict(dict_checkpoint["state_lr_scheduler"])
 
@@ -275,11 +262,10 @@ def main(args):
         del dict_checkpoint
 
     # Warm-start from a previous run's weights but keep a FRESH epoch/optimizer/lr-scheduler,
-    # so this run trains its own schedule from step 0 (e.g. PCO cross-stage warm-start via
-    # `cfg.pco_init_checkpoint`, or plain continued training via `cfg.init_checkpoint` - both
-    # go through the same loader). Skipped when `cfg.resume` (an interrupted run of THIS
-    # output dir is being continued instead, with its own optimizer/lr/epoch state).
-    warm_start_checkpoint = cfg.init_checkpoint or cfg.pco_init_checkpoint
+    # so this run trains its own schedule from step 0 (plain continued training via
+    # `cfg.init_checkpoint`). Skipped when `cfg.resume` (an interrupted run of THIS output
+    # dir is being continued instead, with its own optimizer/lr/epoch state).
+    warm_start_checkpoint = cfg.init_checkpoint
     if not cfg.resume and warm_start_checkpoint:
         if warm_start_checkpoint.endswith(".pt"):
             # single model.pt: backbone-only warm start, FC classifier stays freshly initialized
