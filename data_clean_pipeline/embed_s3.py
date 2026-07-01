@@ -25,8 +25,7 @@ import polars as pl
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common import (COL_ID, COL_SRC, COL_KEY, COL_EMB, ckpt_load, ckpt_append,
-                    write_emb_parquet, log)
+from common import (COL_ID, COL_SRC, COL_KEY, COL_EMB, ckpt_load, ckpt_append, log)
 from config import CFG, CRAWL
 
 
@@ -71,20 +70,18 @@ def run():
         t = torch.from_numpy(np.transpose(img, (2, 0, 1))).float()
         return t.div_(255).sub_(0.5).div_(0.5)
 
-    buf_id, buf_key, buf_emb, just_done, chunk = [], [], [], [], len(os.listdir(out_dir))
+    buf, just_done, chunk = [], [], len(os.listdir(out_dir))
     bs = CFG.embed_batch_size
     total_imgs = 0
 
     def flush():
-        nonlocal buf_id, buf_key, buf_emb, just_done, chunk
-        if buf_id:
-            meta = pl.DataFrame({COL_ID: buf_id, COL_SRC: [CRAWL] * len(buf_id), COL_KEY: buf_key})
-            write_emb_parquet(
-                os.path.join(out_dir, f"part-rank{rank}-{chunk:05d}.parquet"),
-                meta, np.concatenate(buf_emb, axis=0), COL_EMB)
+        nonlocal buf, just_done, chunk
+        if buf:
+            pl.DataFrame(buf).write_parquet(
+                os.path.join(out_dir, f"part-rank{rank}-{chunk:05d}.parquet"))
             chunk += 1
         ckpt_append(ckpt, just_done)
-        buf_id, buf_key, buf_emb, just_done = [], [], [], []
+        buf, just_done = [], []
 
     pbar = tqdm(pids, desc=f"embed_s3 r{rank}", unit="id", position=rank)
     for pid in pbar:
@@ -107,13 +104,12 @@ def run():
                 batch = torch.stack(tensors[i:i + bs]).to(device)
                 with torch.no_grad():
                     fe = net(batch).cpu().numpy().astype(np.float32)
-                buf_emb.append(fe)
-                buf_id.extend([pid] * len(fe))
-                buf_key.extend(keys[i:i + bs])
+                for k, e in zip(keys[i:i + bs], fe):
+                    buf.append({COL_ID: pid, COL_SRC: CRAWL, COL_KEY: k, COL_EMB: e.tolist()})
             just_done.append(pid)
             total_imgs += len(keys)
             pbar.set_postfix(imgs=f"{total_imgs:,}", chunks=chunk)
-            if len(buf_id) >= CFG.embed_flush_rows:
+            if len(buf) >= CFG.embed_flush_rows:
                 flush()
         except Exception as e:
             log(f"[embed_s3] pid {pid} ERR: {e}")

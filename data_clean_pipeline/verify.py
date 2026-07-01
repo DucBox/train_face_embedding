@@ -36,11 +36,9 @@ def v_normalize(src):
             continue
         norms = np.linalg.norm(emb_matrix(df, COL_EMBN), axis=1)
         worst = max(worst, float(np.abs(norms - 1.0).max()))
-    # 1e-3 tolerance: embeddings are stored as float16 (rounding gives ‖v‖ dev
-    # ~1e-4), while a real bug (unnormalized / BGR / wrong dim) gives ~O(0.1+).
-    if worst > 1e-3:
+    if worst > 1e-4:
         die(f"normalize:{src} ‖v‖ deviates from 1.0 by {worst:.2e}")
-    _ok(f"normalize:{src} ‖v‖≈1 (max dev {worst:.2e}, fp16 tol 1e-3)")
+    _ok(f"normalize:{src} ‖v‖≈1 (max dev {worst:.2e})")
 
 
 def v_dbscan(src):

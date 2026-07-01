@@ -71,7 +71,7 @@ def run(src):
         print(f"[normalize]  images = {n_norm:,}")
         print(f"[normalize]  ‖v‖ max|dev from 1.0| = {worst:.2e}  "
               f"(samples {[f'{s:.7f}' for s in sample]})  -> "
-              f"{'OK ~1.0 (fp16)' if worst < 1e-3 else 'BAD'}")
+              f"{'OK ~1.0' if worst < 1e-4 else 'BAD'}")
 
     # 3) DBSCAN (before vs after)
     if os.path.isdir(d_db) and list_parquet(d_db):

@@ -15,7 +15,7 @@ import numpy as np
 import polars as pl
 from tqdm import tqdm
 
-from common import COL_EMB, COL_EMBN, list_parquet, emb_matrix, write_emb_parquet, log
+from common import COL_EMB, COL_EMBN, list_parquet, emb_matrix, log
 from config import CFG, SOURCES
 
 
@@ -29,7 +29,9 @@ def _norm_one(args):
         return 0
     m = emb_matrix(df, COL_EMB)
     m = m / (np.linalg.norm(m, axis=1, keepdims=True) + 1e-9)
-    write_emb_parquet(out_fp, df.drop(COL_EMB), m, COL_EMBN)
+    df = df.drop(COL_EMB).with_columns(
+        pl.Series(COL_EMBN, [r for r in m.astype(np.float32)]))
+    df.write_parquet(out_fp)
     return df.height
 
 
