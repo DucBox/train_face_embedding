@@ -22,6 +22,7 @@ later reader can filter by source file without a full scan:
 `mx.recordio.MXIndexedRecordIO(...).read_idx(rec_idx)` on the matching .rec/.idx file.
 """
 import argparse
+import glob
 import numbers
 import os
 
@@ -81,26 +82,41 @@ class MXEvalDataset(Dataset):
         return sample, int(label), idx
 
 
-def discover_eval_datasets(cfg):
-    """Same file discovery as dataset.get_dataloader(), eval-mode (no augmentation).
+def discover_eval_datasets(cfg, rec_dir=None):
+    """Discover .rec/.idx pairs to embed, supporting two naming conventions:
 
-    Uses cfg.use_synthetic_data / cfg.use_public_data directly by name - note
-    train_v2.py's call into dataset.get_dataloader() passes these two positionally
-    and lands them on the wrong-named (but functionally harmless, since both are
-    True in the active config) kwargs; not relevant here since we match by name.
+    NEW (rec_out from data_clean_pipeline/write_rec.py):
+        train_synthetic_clean.rec  train_public_clean.rec  train_crawl_NNN.rec
+        Detected automatically when train_synthetic_clean.rec is present.
+        Override the directory with --rec-dir (or rec_dir arg); defaults to cfg.rec.
+
+    CLASSIC (original training data layout):
+        train_synthetic.rec / train.rec  train_public.rec  train_N.rec
+        Used when the new naming is not detected.
     """
-    root_dir = cfg.rec
+    root_dir = rec_dir or cfg.rec
     datasets, prefixes = [], []
 
+    # --- new rec_out naming ---
+    if os.path.exists(os.path.join(root_dir, "train_synthetic_clean.rec")):
+        for prefix in ["train_synthetic_clean", "train_public_clean"]:
+            if os.path.exists(os.path.join(root_dir, f"{prefix}.rec")):
+                datasets.append(MXEvalDataset(root_dir, prefix))
+                prefixes.append(prefix)
+        for p in sorted(glob.glob(os.path.join(root_dir, "train_crawl_*.rec"))):
+            prefix = os.path.basename(p)[:-4]
+            datasets.append(MXEvalDataset(root_dir, prefix))
+            prefixes.append(prefix)
+        return datasets, prefixes
+
+    # --- classic naming ---
     main_prefix = "train_synthetic" if cfg.use_synthetic_data else "train"
     if os.path.exists(os.path.join(root_dir, f"{main_prefix}.rec")):
         datasets.append(MXEvalDataset(root_dir, main_prefix))
         prefixes.append(main_prefix)
-
     if cfg.use_public_data and os.path.exists(os.path.join(root_dir, "train_public.rec")):
         datasets.append(MXEvalDataset(root_dir, "train_public"))
         prefixes.append("train_public")
-
     for i in range(1, cfg.num_rec_files):
         prefix = f"train_{i}"
         if os.path.exists(os.path.join(root_dir, f"{prefix}.rec")):
@@ -163,6 +179,10 @@ def main():
     parser.add_argument("--flush-rows", type=int, default=500_000,
                          help="write a Parquet chunk every this many embedded images, "
                               "instead of holding the whole per-rank shard in RAM at once")
+    parser.add_argument("--rec-dir", type=str, default=None,
+                         help="override cfg.rec: directory containing the .rec/.idx files to embed. "
+                              "Use this to point at rec_out/ from data_clean_pipeline/write_rec.py "
+                              "(auto-detected by presence of train_synthetic_clean.rec).")
     args = parser.parse_args()
 
     cfg = get_config(args.config)
@@ -172,7 +192,7 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
-    datasets, prefixes = discover_eval_datasets(cfg)
+    datasets, prefixes = discover_eval_datasets(cfg, rec_dir=args.rec_dir)
     assert datasets, f"No .rec files found under {cfg.rec}"
     full_set = ConcatDataset(datasets)
     # file_prefix per image, resolved straight to the source-file string (no separate
