@@ -1,4 +1,5 @@
 import cv2
+import glob
 
 from tqdm import tqdm
 import numbers
@@ -49,44 +50,46 @@ def get_dataloader(
     
     # Mxnet RecordIO
     else:
-        print(f"Check {num_rec_files} RecordIO files")
         datasets = []
         rec_found = False
 
-        if use_synthetic_dataset == False:
-            rec_main = os.path.join(root_dir, 'train.rec')
-            idx_main = os.path.join(root_dir, 'train.idx')
-            if os.path.exists(rec_main) and os.path.exists(idx_main):
-                print(f"Loading data from {rec_main} and {idx_main}")
-                datasets.append(MXFaceDataset(root_dir=root_dir, file_prefix='train', local_rank=local_rank, use_albumentations=use_albumentations, save_images=save_images, save_dir=save_dir, num_save=num_save))
-                rec_found = True
-        else:
-            rec_main = os.path.join(root_dir, 'train_synthetic.rec')
-            idx_main = os.path.join(root_dir, 'train_synthetic.idx')
-            if os.path.exists(rec_main) and os.path.exists(idx_main):
-                print(f"Loading data from {rec_main} and {idx_main}")
-                datasets.append(MXFaceDataset(root_dir=root_dir, file_prefix='train_synthetic', local_rank=local_rank, use_albumentations=use_albumentations, save_images=save_images, save_dir=save_dir, num_save=num_save))
-                rec_found = True          
-
-        if use_public_dataset==True:
-            print("Using public5m dataset")
-            rec_public = os.path.join(root_dir, 'train_public.rec')
-            idx_public = os.path.join(root_dir, 'train_public.idx')
-            if os.path.exists(rec_public) and os.path.exists(idx_public):
-                print(f"Loading Public: {rec_public}")
-                datasets.append(MXFaceDataset(root_dir=root_dir, file_prefix='train_public', local_rank=local_rank, use_albumentations=use_albumentations, save_images=save_images, save_dir=save_dir, num_save=num_save))
-                rec_found = True
-
-        for i in range(1, num_rec_files):
-            file_prefix = f'train_{i}'
-            rec_i = os.path.join(root_dir, f'{file_prefix}.rec')
-            idx_i = os.path.join(root_dir, f'{file_prefix}.idx')
-
-            if os.path.exists(rec_i) and os.path.exists(idx_i):
+        def _add(prefix):
+            nonlocal rec_found
+            if (os.path.exists(os.path.join(root_dir, f"{prefix}.rec")) and
+                    os.path.exists(os.path.join(root_dir, f"{prefix}.idx"))):
                 if local_rank == 0:
-                    print(f"Loading data from {file_prefix}.rec/.idx")
-                datasets.append(MXFaceDataset(root_dir=root_dir, file_prefix=file_prefix, local_rank=local_rank, use_albumentations=use_albumentations, save_images=save_images, save_dir=save_dir, num_save=num_save))
-                rec_found = True            
+                    print(f"Loading data from {prefix}.rec/.idx")
+                datasets.append(MXFaceDataset(
+                    root_dir=root_dir, file_prefix=prefix, local_rank=local_rank,
+                    use_albumentations=use_albumentations,
+                    save_images=save_images, save_dir=save_dir, num_save=num_save))
+                rec_found = True
+
+        # --- rec_out naming (train_synthetic_clean / train_public_clean / train_crawl_NNN) ---
+        if os.path.exists(os.path.join(root_dir, "train_synthetic_clean.rec")):
+            if local_rank == 0:
+                print("Detected rec_out naming (train_*_clean / train_crawl_NNN)")
+            if use_synthetic_dataset:
+                _add("train_synthetic_clean")
+            if use_public_dataset:
+                _add("train_public_clean")
+            for p in sorted(glob.glob(os.path.join(root_dir, "train_crawl_*.rec"))):
+                _add(os.path.basename(p)[:-4])
+
+        # --- classic naming (train_synthetic / train_public / train_N) ---
+        else:
+            print(f"Check {num_rec_files} RecordIO files")
+            if use_synthetic_dataset == False:
+                _add("train")
+            else:
+                _add("train_synthetic")
+
+            if use_public_dataset:
+                print("Using public5m dataset")
+                _add("train_public")
+
+            for i in range(1, num_rec_files):
+                _add(f"train_{i}")            
         if rec_found: 
             if len(datasets) > 1:
                 print(f"Multi RecordIO files found: {len(datasets)} files")
