@@ -13,6 +13,7 @@ config.t_alpha = 0.01
 # config.network = "vit_l_dinov3"
 config.network = "vit_l_depth36"
 config.resume = False
+config.init_checkpoint = None  # set to "/path/to/model.pt" for backbone warm-start (fresh FC + optimizer)
 config.output = "/workspace/data/workspace/face_embedding/outputs/vit36_webface_synthetic_public_only_new_id_71m_3m6"
 config.embedding_size = 512
 config.sample_rate = 0.3
