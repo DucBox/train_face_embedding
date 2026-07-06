@@ -102,10 +102,10 @@ class PartialFC_V2(torch.nn.Module):
         with torch.no_grad():
             positive = torch.unique(labels[index_positive], sorted=True).cuda()
             if self.num_sample - positive.size(0) >= 0:
-                perm = torch.rand(size=[self.num_local], device=self.weight.device)
+                perm = torch.rand(size=[self.num_local]).cuda()
                 perm[positive] = 2.0
-                index = torch.topk(perm, k=self.num_sample)[1]
-                index = index.sort()[0]
+                index = torch.topk(perm, k=self.num_sample)[1].cuda()
+                index = index.sort()[0].cuda()
             else:
                 index = positive
             self.weight_index = index
