@@ -90,6 +90,29 @@ không phải yêu cầu duyệt tay mọi dòng CSV.
 
 ## Bước 3: xuất một mẫu ảnh và trang review
 
+Để audit theo nguồn và khoảng score thay vì random gộp, dùng sampling-plan JSON:
+
+```bash
+python3 tools/hard_case_review.py review \
+  --db /path/to/hard_review/index.sqlite \
+  --output-dir /path/to/hard_review/view_stratified_001 \
+  --sampling-plan /path/to/review_plan.json \
+  --images-per-class 4 --seed 2048
+```
+
+Plan là list các object có `name`, `kind` (`negative`/`positive`), `count`,
+`score_min` inclusive, `score_max` exclusive và tùy chọn `source_glob` cho positive.
+Ví dụ `{ "name":"crawl", "kind":"positive", "source_glob":"train_crawl_*",
+"score_min":0.2, "score_max":0.4, "count":20 }`.
+Tool reservoir-samples từng stratum với bộ nhớ bounded, dedup overlap, và ghi
+eligible/requested/selected vào `manifest.json`. Khi dùng plan, các flags
+negative-limit/positive-limit/random-each không được dùng. Quá trình sampling có
+thể scan nhiều rows, nhưng không đọc embeddings/ảnh trước khi chọn xong.
+Sample phân tầng này ưu tiên chẩn đoán; không lấy tỷ lệ label noise gộp không trọng
+số làm ước lượng toàn pool vì các strata có sampling fractions khác nhau.
+
+Nếu không có plan, dùng mode extreme + random như sau:
+
 ```bash
 python3 tools/hard_case_review.py review \
   --db /path/to/hard_review/index.sqlite \

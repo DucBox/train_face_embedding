@@ -344,6 +344,50 @@ def select_cases(conn, kind, limit, random_count, seed):
     return top + reservoir
 
 
+def select_sampling_plan(conn, plan_path, seed):
+    plan=json.loads(Path(plan_path).read_text(encoding='utf-8'))
+    if not isinstance(plan,list):
+        raise ValueError('Sampling plan must be a JSON list of strata')
+    result={'negative':[],'positive':[]}
+    counts=[];seen=set()
+    for i,stratum in enumerate(plan):
+        kind=stratum.get('kind');name=stratum.get('name',f'stratum_{i}')
+        if kind not in result:
+            raise ValueError(f'{name}: kind must be negative or positive')
+        limit=nonnegative(stratum['count'])
+        lower=score_value(stratum.get('score_min',-1))
+        upper=float(stratum.get('score_max',1.00001))
+        if not math.isfinite(upper) or not lower<upper<=1.00001:
+            raise ValueError(f'{name}: invalid score interval')
+        source=stratum.get('source_glob')
+        if source is not None and kind!='positive':
+            raise ValueError(f'{name}: source_glob only supported for positive images')
+        table='hard_neg' if kind=='negative' else 'hard_pos'
+        join=' JOIN sources s ON s.id=h.source_id' if source is not None else ''
+        condition=' AND s.prefix GLOB ?' if source is not None else ''
+        order='h.score DESC,h.a,h.b' if kind=='negative' else 'h.score ASC,h.source_id,h.rec_idx'
+        params=[lower,upper]+([source] if source is not None else [])
+        query=f'SELECT h.* FROM {table} h{join} WHERE h.score>=? AND h.score<?{condition} ORDER BY {order}'
+        rng=stable_rng(seed,f'plan-{i}-{name}');pool=[];eligible=0
+        if limit:
+            for row in conn.execute(query,params):
+                row=dict(row)
+                key=(kind,row['a'],row['b']) if kind=='negative' else (kind,row['source_id'],row['rec_idx'])
+                if key in seen:continue
+                eligible+=1
+                if len(pool)<limit:pool.append(row)
+                else:
+                    j=rng.randrange(eligible)
+                    if j<limit:pool[j]=row
+        for row in pool:
+            key=(kind,row['a'],row['b']) if kind=='negative' else (kind,row['source_id'],row['rec_idx'])
+            seen.add(key);row['selection']=f'stratum:{name}'
+            result[kind].append(row)
+        counts.append({'name':name,'kind':kind,'requested':limit,'eligible':eligible,'selected':len(pool)})
+        print(f'Stratum {name}: selected {len(pool)}/{eligible:,} eligible cases',flush=True)
+    return result,counts
+
+
 def class_refs(conn, identity, count, seed, exclude=None):
     rng, result, seen = stable_rng(seed, f'identity-{identity}'), [], 0
     for row in conn.execute('''SELECT s.prefix AS file_prefix,i.rec_idx,i.identity FROM images i
@@ -573,11 +617,17 @@ def review(args):
     rec_dir = args.rec_dir or meta['rec_dir']
     sources = {r['id']:r['prefix'] for r in conn.execute('SELECT * FROM sources')}
     cases, requests = [], {}
-    for row in select_cases(conn,'negative',args.negative_limit,args.random_each,args.seed):
+    if getattr(args,'sampling_plan',None):
+        selected,sampling_counts=select_sampling_plan(conn,args.sampling_plan,args.seed)
+    else:
+        selected={kind:select_cases(conn,kind,limit,args.random_each,args.seed)
+                  for kind,limit in [('negative',args.negative_limit),('positive',args.positive_limit)]}
+        sampling_counts=None
+    for row in selected['negative']:
         groups = [(f"Identity {row['a']}",class_refs(conn,row['a'],args.images_per_class,args.seed)),
                   (f"Identity {row['b']}",class_refs(conn,row['b'],args.images_per_class,args.seed))]
         cases.append(dict(row,kind='negative',id=f"negative_{row['a']}_{row['b']}",groups=groups))
-    for row in select_cases(conn,'positive',args.positive_limit,args.random_each,args.seed):
+    for row in selected['positive']:
         prefix = sources[row['source_id']]
         focus = {'file_prefix':prefix,'rec_idx':row['rec_idx'],'identity':row['label']}
         refs = class_refs(conn,row['label'],args.images_per_class,args.seed,
@@ -605,6 +655,8 @@ def review(args):
     project_id = meta['index_id'] + '-' + uuid.uuid4().hex
     manifest = {'version':VERSION,'project_id':project_id,'db':str(Path(args.db).resolve()),
                 'seed':args.seed,'cases':cases,
+                'sampling_counts':sampling_counts,
+                'sampling_plan':json.loads(Path(args.sampling_plan).read_text()) if getattr(args,'sampling_plan',None) else None,
                 'read_errors':sum(len(c['errors']) for c in cases)}
     (output/'manifest.json').write_text(json.dumps(manifest,indent=2,ensure_ascii=False),encoding='utf-8')
     write_html(cases,output,project_id,args.page_size)
@@ -637,6 +689,7 @@ def parser():
     viewer.add_argument('--page-size',type=int,default=25)
     viewer.add_argument('--max-open-files',type=int,default=4)
     viewer.add_argument('--seed',type=int,default=2048)
+    viewer.add_argument('--sampling-plan',help='JSON strata; overrides limits/random-each. Random bounded-memory sampling per stratum.')
     viewer.set_defaults(run=review)
     return root
 

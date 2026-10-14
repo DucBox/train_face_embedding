@@ -132,6 +132,26 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(s['top_negative_endpoint_fraction'],0)
         self.assertIsNone(s['positive_scores']['mean'])
 
+    def test_stratified_selection_source_score_and_dedup(self):
+        db=self.build();plan=self.root/'plan.json'
+        plan.write_text(json.dumps([
+            {'name':'negative_high','kind':'negative','score_min':.8,'score_max':1.00001,'count':1},
+            {'name':'negative_low','kind':'negative','score_min':.6,'score_max':.8,'count':1},
+            {'name':'synthetic','kind':'positive','source_glob':'train_synthetic_clean','count':1},
+            {'name':'crawl','kind':'positive','source_glob':'train_crawl_*','count':2},
+            {'name':'overlap','kind':'positive','count':10},
+        ]))
+        with tool.open_db(db) as conn,contextlib.redirect_stdout(io.StringIO()):
+            selected,counts=tool.select_sampling_plan(conn,plan,seed=3)
+            again,_=tool.select_sampling_plan(conn,plan,seed=3)
+        self.assertEqual(selected,again)
+        self.assertEqual(len(selected['negative']),2)
+        self.assertEqual(len(selected['positive']),3)
+        self.assertEqual(counts[-1]['selected'],0)
+        self.assertEqual(counts[2]['eligible'],1)
+        self.assertEqual(counts[3]['eligible'],2)
+        self.assertTrue(all(r['score']>=.8 for r in selected['negative'][:1]))
+
     def test_reader_checks_labels_and_array_labels(self):
         reader=tool.RecordReader(self.rec,{'train_public_clean':{8}},max_open=1)
         try:

@@ -1,0 +1,12 @@
+[
+  {"name":"negative_030_040","kind":"negative","score_min":0.3,"score_max":0.4,"count":40},
+  {"name":"negative_040_060","kind":"negative","score_min":0.4,"score_max":0.6,"count":20},
+  {"name":"negative_060_095","kind":"negative","score_min":0.6,"score_max":0.95,"count":20},
+  {"name":"negative_095_100","kind":"negative","score_min":0.95,"score_max":1.00001,"count":20},
+  {"name":"positive_webface_mix_below_zero","kind":"positive","source_glob":"train_synthetic_clean","score_min":-1,"score_max":0,"count":20},
+  {"name":"positive_webface_mix_000_020","kind":"positive","source_glob":"train_synthetic_clean","score_min":0,"score_max":0.2,"count":20},
+  {"name":"positive_webface_mix_020_040","kind":"positive","source_glob":"train_synthetic_clean","score_min":0.2,"score_max":0.4,"count":20},
+  {"name":"positive_crawl_below_020","kind":"positive","source_glob":"train_crawl_*","score_min":-1,"score_max":0.2,"count":20},
+  {"name":"positive_crawl_020_040","kind":"positive","source_glob":"train_crawl_*","score_min":0.2,"score_max":0.4,"count":10},
+  {"name":"positive_public","kind":"positive","source_glob":"train_public_clean","score_min":-1,"score_max":0.4,"count":10}
+]
