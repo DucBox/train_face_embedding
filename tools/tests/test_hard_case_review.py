@@ -105,6 +105,33 @@ class ReviewTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()),self.assertRaisesRegex(ValueError,'mismatch'):
             tool.build_index(index_args(self.root,self.rec,self.embed,self.hard))
 
+    def test_stats_counts_undirected_pairs_and_concentration(self):
+        db=self.build();out=self.root/'stats'
+        args=argparse.Namespace(db=str(db),output_dir=str(out),top_identities=2)
+        with contextlib.redirect_stdout(io.StringIO()):tool.pool_stats(args)
+        s=json.loads((out/'summary.json').read_text())
+        self.assertEqual(s['negative_unique_pairs'],3)
+        self.assertEqual(s['negative_affected_identities'],5)
+        self.assertEqual(s['positive_unique_hard_images'],3)
+        self.assertEqual(s['top_negative_identities'][0]['identity'],0)
+        self.assertEqual(s['top_negative_identities'][0]['degree'],2)
+        self.assertEqual(sum(r['count'] for r in s['negative_score_histogram']),3)
+        self.assertEqual(sum(r['count'] for r in s['positive_score_histogram']),3)
+        self.assertAlmostEqual(s['top_negative_endpoint_fraction'],.5)
+        with tool.open_db(db) as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM hard_neg').fetchone()[0],3)
+
+    def test_stats_empty_pool(self):
+        (self.hard/'hard_class_neighbors.csv').write_text('class_id,neighbor_class_id,score\n')
+        (self.hard/'hard_images_review.csv').write_text('file_prefix,rec_idx,label,genuine_score\n')
+        db=self.build();out=self.root/'empty_stats'
+        with contextlib.redirect_stdout(io.StringIO()):
+            tool.pool_stats(argparse.Namespace(db=str(db),output_dir=str(out),top_identities=2))
+        s=json.loads((out/'summary.json').read_text())
+        self.assertEqual(s['negative_unique_pairs'],0)
+        self.assertEqual(s['top_negative_endpoint_fraction'],0)
+        self.assertIsNone(s['positive_scores']['mean'])
+
     def test_reader_checks_labels_and_array_labels(self):
         reader=tool.RecordReader(self.rec,{'train_public_clean':{8}},max_open=1)
         try:

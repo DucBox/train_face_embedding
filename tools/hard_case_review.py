@@ -230,6 +230,93 @@ def stable_rng(seed, token):
     return random.Random(int.from_bytes(digest[:8], 'big'))
 
 
+def pool_stats(args):
+    output = Path(args.output_dir).resolve()
+    if output.exists() and any(output.iterdir()):
+        raise FileExistsError(f'{output} is not empty; choose a fresh --output-dir')
+    output.mkdir(parents=True,exist_ok=True)
+    conn = open_db(args.db)
+    try:
+        # Temporary tables live separately from the read-only source DB.
+        conn.execute('PRAGMA temp_store=FILE')
+        conn.execute('PRAGMA cache_size=-65536')
+        print('Counting hard cases and identity concentration (no image reads)...',flush=True)
+        conn.execute('''CREATE TEMP TABLE neg_degrees AS SELECT identity,COUNT(*) AS degree
+            FROM (SELECT a AS identity FROM hard_neg UNION ALL SELECT b FROM hard_neg)
+            GROUP BY identity''')
+        neg_count = conn.execute('SELECT COUNT(*) FROM hard_neg').fetchone()[0]
+        pos_count = conn.execute('SELECT COUNT(*) FROM hard_pos').fetchone()[0]
+        top_neg = [dict(r) for r in conn.execute('''SELECT identity,degree FROM neg_degrees
+            ORDER BY degree DESC,identity LIMIT ?''',(args.top_identities,))]
+        top_pos = [dict(r) for r in conn.execute('''SELECT label AS identity,COUNT(*) AS hard_images
+            FROM hard_pos GROUP BY label ORDER BY hard_images DESC,label LIMIT ?''',
+                                              (args.top_identities,))]
+        for row in top_neg + top_pos:
+            row['dataset_images'] = conn.execute('SELECT COUNT(*) FROM images WHERE identity=?',
+                                                 (row['identity'],)).fetchone()[0]
+        for row in top_pos:
+            row['hard_image_fraction'] = row['hard_images']/row['dataset_images']
+        by_source = [dict(r) for r in conn.execute('''SELECT s.prefix AS file_prefix,COUNT(*) AS hard_images,
+            COUNT(DISTINCT h.label) AS affected_identities FROM hard_pos h JOIN sources s
+            ON s.id=h.source_id GROUP BY s.id ORDER BY hard_images DESC,s.prefix''')]
+        edges = [-1.00001,0,.2,.3,.4,.5,.6,.7,.8,.9,.95,.98,1.00001]
+        def histogram(table):
+            expressions = ','.join(f'SUM(CASE WHEN score>=? AND score<? THEN 1 ELSE 0 END) AS b{i}'
+                                  for i in range(len(edges)-1))
+            params = [v for a,b in zip(edges,edges[1:]) for v in (a,b)]
+            counts = conn.execute(f'SELECT {expressions} FROM {table}',params).fetchone()
+            return [{'lower_inclusive':a,'upper_exclusive':b,'count':counts[i] or 0}
+                    for i,(a,b) in enumerate(zip(edges,edges[1:]))]
+        def score_summary(table):
+            row = conn.execute(f'SELECT MIN(score) AS min,MAX(score) AS max,AVG(score) AS mean FROM {table}').fetchone()
+            return dict(row)
+        summary = {
+            'db':str(Path(args.db).resolve()),
+            'negative_unique_pairs':neg_count,
+            'negative_affected_identities':conn.execute('SELECT COUNT(*) FROM neg_degrees').fetchone()[0],
+            'positive_unique_hard_images':pos_count,
+            'positive_affected_identities':conn.execute('SELECT COUNT(DISTINCT label) FROM hard_pos').fetchone()[0],
+            'negative_scores':score_summary('hard_neg'),'positive_scores':score_summary('hard_pos'),
+            'negative_score_histogram':histogram('hard_neg'),'positive_score_histogram':histogram('hard_pos'),
+            'top_negative_identities':top_neg,'top_positive_identities':top_pos,
+            'positive_by_source':by_source,
+            'top_negative_endpoint_fraction':sum(r['degree'] for r in top_neg)/(2*neg_count) if neg_count else 0,
+            'top_positive_image_fraction':sum(r['hard_images'] for r in top_pos)/pos_count if pos_count else 0,
+            'notes':[
+                'Negative CSV symmetric rows are counted once per unordered identity pair.',
+                'Negative endpoint fraction counts two endpoints/pair, not unique pair coverage.',
+                'Identity degree or extreme score is a review priority, not proof of label noise.',
+                'Source counts apply to hard images; identities may span multiple sources.',
+            ],
+        }
+        (output/'summary.json').write_text(json.dumps(summary,indent=2,ensure_ascii=False),encoding='utf-8')
+        for name,rows,columns in [
+            ('top_negative_identities.csv',top_neg,['identity','degree','dataset_images']),
+            ('top_positive_identities.csv',top_pos,['identity','hard_images','dataset_images','hard_image_fraction']),
+            ('positive_by_source.csv',by_source,['file_prefix','hard_images','affected_identities']),
+        ]:
+            with (output/name).open('w',newline='',encoding='utf-8') as stream:
+                writer=csv.DictWriter(stream,fieldnames=columns);writer.writeheader();writer.writerows(rows)
+        lines = [
+            f'Negative unique identity pairs: {neg_count:,}',
+            f'Negative affected identities: {summary["negative_affected_identities"]:,}',
+            f'Positive hard images: {pos_count:,}',
+            f'Positive affected identities: {summary["positive_affected_identities"]:,}',
+            f'Top {len(top_neg)} identities share of negative endpoints: {summary["top_negative_endpoint_fraction"]:.2%}',
+            f'Top {len(top_pos)} identities share of positive hard images: {summary["top_positive_image_fraction"]:.2%}',
+            '', 'Top negative identities (id / number of neighbor identities / dataset images):',
+        ] + [f'{r["identity"]} / {r["degree"]:,} / {r["dataset_images"]:,}' for r in top_neg]
+        lines += ['', 'Top positive identities (id / hard images / dataset images):']
+        lines += [f'{r["identity"]} / {r["hard_images"]:,} / {r["dataset_images"]:,}' for r in top_pos]
+        lines += ['', 'Concentration identifies groups to inspect; it does not automatically exclude them.']
+        text='\n'.join(lines)+'\n'
+        (output/'summary.txt').write_text(text,encoding='utf-8')
+        print(text,flush=True)
+        print(f'Statistics ready: {output}',flush=True)
+    finally:
+        conn.close()
+
+
 def select_cases(conn, kind, limit, random_count, seed):
     table = 'hard_neg' if kind == 'negative' else 'hard_pos'
     order = 'score DESC,a,b' if kind == 'negative' else 'score ASC,source_id,rec_idx'
@@ -534,6 +621,11 @@ def parser():
     index.add_argument('--db',required=True)
     index.add_argument('--batch-size',type=int,default=50000)
     index.set_defaults(run=build_index)
+    stats = sub.add_parser('stats',help='Count hard pool, score distributions and identity concentration; no images')
+    stats.add_argument('--db',required=True)
+    stats.add_argument('--output-dir',required=True)
+    stats.add_argument('--top-identities',type=int,default=30)
+    stats.set_defaults(run=pool_stats)
     viewer = sub.add_parser('review',help='Render sampled hard cases and browser decision/export UI')
     viewer.add_argument('--db',required=True)
     viewer.add_argument('--rec-dir',help='Override RecordIO directory recorded in the index')
@@ -551,7 +643,7 @@ def parser():
 
 def main():
     args = parser().parse_args()
-    for name in ['batch_size','images_per_class','page_size','max_open_files']:
+    for name in ['batch_size','images_per_class','page_size','max_open_files','top_identities']:
         if hasattr(args,name) and getattr(args,name)<=0:
             raise SystemExit(f'--{name.replace("_","-")} must be positive')
     for name in ['negative_limit','positive_limit','random_each']:

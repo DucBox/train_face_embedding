@@ -68,7 +68,27 @@ references**, chưa tính `global_idx` của ConcatDataset. Khi viết sampler s
 cần map references theo thứ tự dataset loader thật, không dùng `rec_idx` như
 global dataset index.
 
-## Bước 3: xuất ảnh và trang review
+## Sau index: thống kê trước khi chọn ảnh review
+
+```bash
+python3 tools/hard_case_review.py stats \
+  --db /path/to/hard_review/index.sqlite \
+  --output-dir /path/to/hard_review/stats_001 \
+  --top-identities 30
+```
+
+Không đọc ảnh hay embeddings, không thay đổi DB. Outputs: `summary.txt`,
+`summary.json`, `top_negative_identities.csv`, `top_positive_identities.csv`,
+`positive_by_source.csv`. Báo số unique negative pairs (gộp A→B/B→A), hard images,
+affected identities, score histograms và độ tập trung lỗi theo identity.
+Negative concentration là share của **hai endpoints/pair**, không phải share của
+unique pairs. Identity xuất hiện nhiều là ưu tiên xem, chưa phải bằng chứng nhãn sai.
+Thống kê trên pool lớn vẫn có thể mất thời gian và disk cho temporary SQL grouping.
+
+Đọc stats trước để quyết định lượng và nhóm cần review. Review là audit theo mẫu,
+không phải yêu cầu duyệt tay mọi dòng CSV.
+
+## Bước 3: xuất một mẫu ảnh và trang review
 
 ```bash
 python3 tools/hard_case_review.py review \
@@ -135,8 +155,11 @@ Các nút download xuất CSV từ decisions đã lưu trong browser:
 - `excluded_images.csv`: các ảnh exclude/unsure.
 
 Các file được browser tải về, không tự ghi ngược vào thư mục server. Lưu chúng
-trong thư mục review của run. Chỉ dùng approved pool đã kiểm tra cho bước sampler;
+trong thư mục review của run. Approved CSV chỉ ghi những case cụ thể đã xem;
 **không hiểu rằng phần CSV gốc chưa xuất hiện trong viewer đều được approve**.
+Ở quy mô lớn, các decisions dùng để audit chất lượng/lọc các nhóm có lỗi: sau khi
+đánh giá pool, sampler có thể dùng pool sau lọc với cap identity/edge. Không yêu cầu
+duyệt tay toàn bộ pool, nhưng cũng không tự coi sampling audit là chứng nhận tất cả nhãn.
 Quyết định lưu trong localStorage của cùng browser/origin; export trước khi đổi
 browser, port, máy hoặc xóa browser data. Tạo output viewer mới nếu muốn lấy mẫu
 mới; thư mục output không rỗng sẽ bị từ chối để tránh ảnh/manifest cũ lẫn run mới.
@@ -157,5 +180,5 @@ Chạy tests từ root repo nếu đặt test trong `tools/tests/`:
 python3 -m unittest discover -s tools/tests -p 'test_hard_case_review.py' -v
 ```
 
-Sau review, công việc tiếp theo là mixed BatchSampler dùng approved manifests;
+Sau stats và sampling review, công việc tiếp theo là mixed BatchSampler dùng pool đã lọc;
 tool này chưa thay đổi training behavior.
